@@ -51,7 +51,7 @@ async function bfMaybe(path: string, apiKey: string) {
 
 async function normalizeAddressHex(input: string): Promise<string> {
   const value = input.trim();
-  if (!value) throw new Error("Dirección destino vacía");
+  if (!value) throw new Error("Destination address is empty");
 
   const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
 
@@ -61,14 +61,14 @@ async function normalizeAddressHex(input: string): Promise<string> {
       lib.Address.from_bytes(Buffer.from(normalized, "hex"));
       return normalized;
     } catch {
-      throw new Error("Dirección hex inválida");
+      throw new Error("Invalid hex address");
     }
   }
 
   try {
     return Buffer.from(lib.Address.from_bech32(value).to_bytes()).toString("hex");
   } catch {
-    throw new Error("Dirección bech32 inválida");
+    throw new Error("Invalid bech32 address");
   }
 }
 
@@ -111,9 +111,9 @@ export async function POST(req: NextRequest) {
       blockfrostApiKey?.trim() || process.env.BLOCKFROST_API_KEY?.trim() || "";
 
     if (!mnemonic || !validateMnemonic(mnemonic.trim()))
-      return NextResponse.json({ error: "Mnemonic inválido" }, { status: 400 });
+      return NextResponse.json({ error: "Invalid mnemonic" }, { status: 400 });
     if (!toAddressHex || !effectiveBlockfrostKey)
-      return NextResponse.json({ error: "Faltan parámetros" }, { status: 400 });
+      return NextResponse.json({ error: "Missing required parameters" }, { status: 400 });
 
     const recipientAddressHex = await normalizeAddressHex(toAddressHex);
 
@@ -137,7 +137,7 @@ export async function POST(req: NextRequest) {
       ) as BlockfrostUtxo[] | null;
 
       if (!utxos?.length) {
-        return NextResponse.json({ error: "No hay UTXOs en la dirección origen" }, { status: 400 });
+        return NextResponse.json({ error: "No UTxOs found at the source address" }, { status: 400 });
       }
 
       let txHex: string;
@@ -190,13 +190,13 @@ export async function POST(req: NextRequest) {
       }
 
       if (!isRetryableSubmitError(submitText) || attempt === 2) {
-        return NextResponse.json({ error: `Submit falló: ${submitText}` }, { status: 502 });
+        return NextResponse.json({ error: `Submit failed: ${submitText}` }, { status: 502 });
       }
 
       await sleep(4_000);
     }
 
-    return NextResponse.json({ error: "No se pudo enviar la transacción después de reintentar" }, { status: 502 });
+    return NextResponse.json({ error: "Could not submit the transaction after retrying" }, { status: 502 });
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }

@@ -202,9 +202,9 @@ export async function buildAdaTx(params: {
     ? totalIn - reservedForChange - FEE_ESTIMATE
     : params.amountLovelace;
   const change  = totalIn - sendAmt - FEE_ESTIMATE;
-  if (sendAmt <= 0n) throw new Error("Fondos insuficientes");
+  if (sendAmt <= 0n) throw new Error("Insufficient funds");
   if (!sendAll && tokenChangeRequired && change < MIN_TOKEN_LOVELACE) {
-    throw new Error("ADA insuficiente para devolver los tokens en el cambio");
+    throw new Error("Not enough ADA to return token change");
   }
 
   const inputs = lib.TransactionInputs.new();
@@ -267,7 +267,7 @@ export async function buildNightTx(params: {
   const nightUtxos = utxos.filter(u =>
     u.amount.some(a => a.unit === `${NIGHT_POLICY}${NIGHT_NAME}`)
   );
-  if (nightUtxos.length === 0) throw new Error("No se encontró NIGHT en los UTXOs");
+  if (nightUtxos.length === 0) throw new Error("No NIGHT found in the UTxOs");
 
   // Also grab pure-ADA UTXOs for fee payment
   const adaUtxos = utxos.filter(u => u.amount.length === 1);
@@ -281,7 +281,7 @@ export async function buildNightTx(params: {
     totalNight += BigInt(u.amount.find(a => a.unit === `${NIGHT_POLICY}${NIGHT_NAME}`)?.quantity ?? "0");
   }
 
-  if (nightAmount > totalNight) throw new Error("NIGHT insuficiente");
+  if (nightAmount > totalNight) throw new Error("Insufficient NIGHT");
 
   // Build multiasset value for recipient
   const CredCls    = lib.Credential ?? lib.StakeCredential; void CredCls;
@@ -298,7 +298,7 @@ export async function buildNightTx(params: {
   // Change value: remaining ADA + remaining NIGHT
   const remainingNight = totalNight - nightAmount;
   const remainingAda   = totalAda - MIN_TOKEN_LOVELACE - FEE_ESTIMATE;
-  if (remainingAda < 0n) throw new Error("ADA insuficiente para cubrir el mínimo UTXO + fee");
+  if (remainingAda < 0n) throw new Error("Insufficient ADA to cover the minimum UTxO plus fee");
 
   const inputs = lib.TransactionInputs.new();
   for (const u of allChosen) {
@@ -357,10 +357,10 @@ export async function buildSponsoredNightTx(params: {
   const senderNightUtxos = senderUtxos.filter((u) =>
     u.amount.some((a) => a.unit === `${NIGHT_POLICY}${NIGHT_NAME}`)
   );
-  if (senderNightUtxos.length === 0) throw new Error("No se encontró NIGHT en los UTXOs");
+  if (senderNightUtxos.length === 0) throw new Error("No NIGHT found in the UTxOs");
 
   const sponsorAdaUtxos = sponsorUtxos.filter((u) => u.amount.length === 1).slice(0, 2);
-  if (sponsorAdaUtxos.length === 0) throw new Error("No se encontró sponsor con ADA disponible");
+  if (sponsorAdaUtxos.length === 0) throw new Error("No sponsor with available ADA was found");
 
   let totalSenderAda = BigInt(0);
   let totalNight = BigInt(0);
@@ -374,9 +374,9 @@ export async function buildSponsoredNightTx(params: {
     totalSponsorAda += BigInt(u.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0");
   }
 
-  if (nightAmount > totalNight) throw new Error("NIGHT insuficiente");
+  if (nightAmount > totalNight) throw new Error("Insufficient NIGHT");
   if (totalSenderAda + totalSponsorAda < MIN_TOKEN_LOVELACE + FEE_ESTIMATE) {
-    throw new Error("ADA insuficiente incluso con sponsor para cubrir mínimo UTXO + fee");
+    throw new Error("Insufficient ADA even with a sponsor to cover the minimum UTxO plus fee");
   }
 
   const policyHash = lib.ScriptHash.from_bytes(Buffer.from(NIGHT_POLICY, "hex"));

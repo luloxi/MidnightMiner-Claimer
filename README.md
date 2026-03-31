@@ -1,4 +1,4 @@
-# midnight-claimer
+# MidnightMiner-Claimer
 
 Small local Next.js app to:
 
@@ -48,15 +48,15 @@ http://localhost:3000
 1. Paste your seed phrase.
 2. Optionally paste your Blockfrost API key.
 3. Choose how many wallets and accounts to scan.
-4. Click `Derivar y ver balances`.
+4. Click `Derive and Load Balances`.
 
 Main actions:
 
 - `Claim NIGHT`: claims NIGHT for one wallet
 - `Play mode`: runs claims sequentially
-- `Transferir`: sends ADA or NIGHT
-- `Consolidar NIGHT`: sends all NIGHT from all wallets with NIGHT to one custom address
-- `Pasar ADA`: sends almost all ADA to the next account, keeping a small reserve
+- `Transfer`: sends ADA or NIGHT
+- `Consolidate NIGHT`: sends all NIGHT from all wallets with NIGHT to one custom address
+- `Move ADA`: sends almost all ADA to the next account, keeping a small reserve
 
 ## Notes
 

@@ -29,11 +29,11 @@ export async function POST(req: NextRequest) {
       blockfrostApiKey?.trim() || process.env.BLOCKFROST_API_KEY?.trim() || "";
 
     if (!txHash?.trim()) {
-      return NextResponse.json({ error: "Falta txHash" }, { status: 400 });
+      return NextResponse.json({ error: "Missing txHash" }, { status: 400 });
     }
 
     if (!effectiveBlockfrostKey) {
-      return NextResponse.json({ error: "Falta BLOCKFROST_API_KEY" }, { status: 400 });
+      return NextResponse.json({ error: "Missing BLOCKFROST_API_KEY" }, { status: 400 });
     }
 
     const tx = await bf(`/txs/${txHash.trim()}`, effectiveBlockfrostKey) as

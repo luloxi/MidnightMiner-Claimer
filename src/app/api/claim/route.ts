@@ -82,7 +82,7 @@ async function buildClaimTx(
     method: "POST",
     headers: {
       accept: "application/json, text/plain, */*",
-      "accept-language": "es-419,es;q=0.9",
+      "accept-language": "en-US,en;q=0.9",
       "Content-Type": "application/json",
       origin: "https://redeem.midnight.gd",
       referer: "https://redeem.midnight.gd/",
@@ -208,7 +208,7 @@ async function waitForValidityWindow(txHex: string, blockfrostApiKey: string) {
   }
 
   throw new Error(
-    `La tx no llegó a la ventana de validez a tiempo (slot requerido ${requiredSlot})`
+    `The transaction did not reach its validity window in time (required slot ${requiredSlot})`
   );
 }
 
@@ -280,10 +280,10 @@ export async function POST(req: NextRequest) {
       blockfrostApiKey?.trim() || process.env.BLOCKFROST_API_KEY?.trim() || "";
 
     if (!mnemonic || !validateMnemonic(mnemonic.trim())) {
-      return NextResponse.json({ error: "Mnemonic inválido" }, { status: 400 });
+      return NextResponse.json({ error: "Invalid mnemonic" }, { status: 400 });
     }
     if (!effectiveBlockfrostKey) {
-      return NextResponse.json({ error: "Falta BLOCKFROST_API_KEY" }, { status: 400 });
+      return NextResponse.json({ error: "Missing BLOCKFROST_API_KEY" }, { status: 400 });
     }
 
     const { signingKeyHex, baseAddressHex } = await deriveSigningKey(
@@ -321,7 +321,7 @@ export async function POST(req: NextRequest) {
         (wallet) => wallet.accountIndex === sponsorAccountIndex && wallet.index === 0
       );
       if (!sponsorWallet) {
-        return NextResponse.json({ error: "Sponsor inválido" }, { status: 400 });
+        return NextResponse.json({ error: "Invalid sponsor" }, { status: 400 });
       }
 
       const { signingKeyHex: sponsorSigningKeyHex } = await deriveSigningKey(
@@ -381,14 +381,14 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({
             code: "NO_REDEEMABLE_THAWS",
             error: noRedeemableInfo.nextThawAt
-              ? `Todavía no hay thaw reclamable. Próximo thaw: ${noRedeemableInfo.nextThawAt}`
-              : "Todavía no hay thaw reclamable para esta wallet.",
+              ? `There is no claimable thaw yet. Next thaw: ${noRedeemableInfo.nextThawAt}`
+              : "There is no claimable thaw yet for this wallet.",
             nextThawAt: noRedeemableInfo.nextThawAt,
             nowAt: noRedeemableInfo.nowAt,
           }, { status: 409 });
         }
         return NextResponse.json({
-          error: lastBuildError || "No se encontró sponsor con ADA suficiente para reclamar",
+          error: lastBuildError || "No sponsor with enough ADA was found to submit the claim",
         }, { status: 400 });
       }
 
@@ -415,7 +415,7 @@ export async function POST(req: NextRequest) {
 
       if (!isSpentInputsSubmitError(submitText) || submitAttempt === 2) {
         return NextResponse.json({
-          error: `Submit falló: ${submitText}`,
+          error: `Submit failed: ${submitText}`,
         }, { status: 502 });
       }
 
@@ -423,7 +423,7 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({
-      error: "No se pudo enviar la claim después de reintentar con UTxOs frescos",
+      error: "Could not submit the claim after retrying with fresh UTxOs",
     }, { status: 502 });
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 });

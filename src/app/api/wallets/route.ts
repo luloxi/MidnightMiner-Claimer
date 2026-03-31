@@ -7,7 +7,7 @@ export async function POST(req: NextRequest) {
     const { mnemonic, count = 20, accountIndex = 0, maxAccounts = 1 } = await req.json();
 
     if (!mnemonic || !validateMnemonic(mnemonic.trim())) {
-      return NextResponse.json({ error: "Mnemonic inválido" }, { status: 400 });
+      return NextResponse.json({ error: "Invalid mnemonic" }, { status: 400 });
     }
 
     const n   = Math.min(Math.max(Number(count), 1), 50);

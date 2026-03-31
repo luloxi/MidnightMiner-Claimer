@@ -106,7 +106,7 @@ function TransferModal({
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <div>
-            <h2 className="text-white font-semibold">Transferir fondos</h2>
+            <h2 className="text-white font-semibold">Transfer Funds</h2>
             <p className="mt-0.5 font-mono text-xs text-slate-500">
               Account {state.wallet.accountIndex} / Index {state.wallet.index}
             </p>
@@ -123,7 +123,7 @@ function TransferModal({
           {/* Currency */}
           <div>
             <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest block mb-1.5">
-              Moneda
+              Currency
             </label>
             <div className="flex w-fit overflow-hidden rounded-xl border border-white/10 bg-slate-900/80 text-sm">
               {(["ADA", "NIGHT"] as ("ADA" | "NIGHT")[]).map(c => (
@@ -151,7 +151,7 @@ function TransferModal({
           {/* Destination */}
           <div>
             <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest block mb-1.5">
-              Destino
+              Destination
             </label>
             <select
               value={state.destType}
@@ -172,7 +172,7 @@ function TransferModal({
                 type="text"
                 value={state.customAddr}
                 onChange={e => onChange({ customAddr: e.target.value })}
-                placeholder="addr1q... o hex de bytes de la dirección"
+                placeholder="addr1q... or raw address bytes in hex"
                 className="mt-2 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm
                            text-slate-100 placeholder-slate-600 focus:outline-none focus:border-slate-500
                            font-mono"
@@ -183,15 +183,15 @@ function TransferModal({
           {/* Amount */}
           <div>
             <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest block mb-1.5">
-              Monto
+              Amount
             </label>
             <div className="flex items-center gap-3">
               <input
                 type="text"
-                value={state.sendAll ? "todo" : state.amount}
+                value={state.sendAll ? "all" : state.amount}
                 onChange={e => onChange({ amount: e.target.value, sendAll: false })}
                 disabled={state.sendAll}
-                placeholder={state.currency === "ADA" ? "lovelace (ej: 2000000)" : "unidades raw (ej: 50000000)"}
+                placeholder={state.currency === "ADA" ? "lovelace (e.g. 2000000)" : "raw units (e.g. 50000000)"}
                 className="flex-1 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm
                            text-slate-100 placeholder-slate-600 focus:outline-none focus:border-slate-500
                            font-mono disabled:opacity-40"
@@ -203,21 +203,21 @@ function TransferModal({
                   onChange={e => onChange({ sendAll: e.target.checked, amount: "" })}
                   className="accent-violet-500"
                 />
-                Enviar todo
+                Send all
               </label>
             </div>
             {state.currency === "ADA" && (
               <p className="text-xs text-slate-600 mt-1">1 ADA = 1,000,000 lovelace</p>
             )}
             {state.currency === "NIGHT" && (
-              <p className="text-xs text-slate-600 mt-1">1 NIGHT = 1,000,000 unidades · requiere ~1.5 ADA de gas</p>
+              <p className="text-xs text-slate-600 mt-1">1 NIGHT = 1,000,000 units · requires ~1.5 ADA for gas</p>
             )}
           </div>
 
           {/* Result / Error */}
           {state.result && (
             <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/40 p-3 text-sm">
-              <p className="text-green-300 font-semibold">Transacción enviada</p>
+              <p className="text-green-300 font-semibold">Transaction submitted</p>
               <p className="text-green-400 font-mono text-xs mt-1 break-all">{state.result.txHash}</p>
               <a
                 href={state.result.explorerUrl}
@@ -225,7 +225,7 @@ function TransferModal({
                 rel="noopener noreferrer"
                 className="text-violet-400 hover:text-violet-300 text-xs underline mt-1 block"
               >
-                Ver en Cardanoscan →
+                View on Cardanoscan →
               </a>
             </div>
           )}
@@ -242,7 +242,7 @@ function TransferModal({
             onClick={onClose}
             className="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 transition-colors"
           >
-            Cancelar
+            Cancel
           </button>
           <button
             onClick={onSubmit}
@@ -261,9 +261,9 @@ function TransferModal({
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
                 </svg>
-                Enviando…
+                Sending...
               </>
-            ) : "Enviar"}
+            ) : "Send"}
           </button>
         </div>
       </div>
@@ -528,13 +528,13 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || "No se pudo verificar la transacción");
+        throw new Error(data.error || "Could not verify the transaction");
       }
       if (data.confirmed) return data as { confirmed: boolean; confirmations: number; explorerUrl: string };
       await sleep(4_000);
     }
 
-    throw new Error("La transacción no confirmó a tiempo");
+    throw new Error("The transaction did not confirm in time");
   }
 
   async function claimNightAndWait(w: Wallet) {
@@ -585,7 +585,7 @@ export default function Home() {
       wallets.find((x) => x.accountIndex === w.accountIndex + 1 && x.index === 0) ?? null;
 
     if (!nextWallet) {
-      setRowAction(w.baseAddress, { error: "No existe la siguiente dirección en la lista." });
+      setRowAction(w.baseAddress, { error: "The next address is not available in the current list." });
       return;
     }
 
@@ -648,7 +648,7 @@ export default function Home() {
     if (!canClaimWallet(w)) {
       setRowAction(w.baseAddress, {
         loading: false,
-        error: `Claimable menor al mínimo configurado (${getMinClaimNightValue().toFixed(4)} NIGHT).`,
+        error: `Claimable amount is below the configured minimum (${getMinClaimNightValue().toFixed(4)} NIGHT).`,
         result: null,
       });
       return;
@@ -668,8 +668,8 @@ export default function Home() {
         claimedCount: 0,
         totalCount: 0,
         lastMessage: minClaim > 0
-          ? `No hay wallets con al menos ${minClaim.toFixed(4)} NIGHT reclamable.`
-          : "No hay wallets con NIGHT reclamable.",
+          ? `No wallets have at least ${minClaim.toFixed(4)} claimable NIGHT.`
+          : "No wallets have claimable NIGHT.",
         stopRequested: false,
       });
       return;
@@ -680,7 +680,7 @@ export default function Home() {
       currentAddress: null,
       claimedCount: 0,
       totalCount: initialWallets.length,
-      lastMessage: `Play mode iniciado. ${initialWallets.length} wallet(s) pendientes.`,
+      lastMessage: `Play mode started. ${initialWallets.length} wallet(s) pending.`,
       stopRequested: false,
     });
 
@@ -693,7 +693,7 @@ export default function Home() {
             ...prev,
             running: false,
             currentAddress: null,
-            lastMessage: `Play mode detenido. ${claimedCount}/${prev.totalCount} claims completados.`,
+            lastMessage: `Play mode stopped. ${claimedCount}/${prev.totalCount} claims completed.`,
           }));
           return;
         }
@@ -706,7 +706,7 @@ export default function Home() {
             running: false,
             currentAddress: null,
             claimedCount,
-            lastMessage: `Play mode completo. ${claimedCount} claim(s) confirmados.`,
+            lastMessage: `Play mode complete. ${claimedCount} claim(s) confirmed.`,
             stopRequested: false,
           }));
           playCompletionSound();
@@ -726,7 +726,7 @@ export default function Home() {
           ...prev,
           claimedCount,
           currentAddress: null,
-          lastMessage: `${formatWalletLabel(nextWallet)} confirmado. Buscando el siguiente claim...`,
+          lastMessage: `${formatWalletLabel(nextWallet)} confirmed. Looking for the next claim...`,
         }));
       }
     } catch (e) {
@@ -735,7 +735,7 @@ export default function Home() {
         running: false,
         currentAddress: null,
         claimedCount,
-        lastMessage: `Play mode frenado por error: ${String(e)}`,
+        lastMessage: `Play mode stopped due to an error: ${String(e)}`,
         stopRequested: false,
       }));
     }
@@ -745,7 +745,7 @@ export default function Home() {
     setPlayState((prev) => ({
       ...prev,
       stopRequested: true,
-      lastMessage: prev.running ? "Deteniendo play mode al terminar la transacción actual..." : prev.lastMessage,
+      lastMessage: prev.running ? "Stopping play mode after the current transaction finishes..." : prev.lastMessage,
     }));
   }
 
@@ -788,7 +788,7 @@ export default function Home() {
   async function consolidateNightToCustomAddress() {
     const destination = consolidationAddress.trim();
     if (!destination) {
-      setError("Ingresá una dirección custom para consolidar NIGHT.");
+      setError("Enter a custom address to consolidate NIGHT.");
       return;
     }
 
@@ -808,7 +808,7 @@ export default function Home() {
         running: false,
         submittedCount: 0,
         totalCount: 0,
-        lastMessage: "No hay wallets con NIGHT para consolidar.",
+        lastMessage: "No wallets have NIGHT to consolidate.",
       });
       return;
     }
@@ -817,7 +817,7 @@ export default function Home() {
       running: true,
       submittedCount: 0,
       totalCount: walletsWithNight.length,
-      lastMessage: `Consolidando NIGHT desde ${walletsWithNight.length} wallet(s)...`,
+      lastMessage: `Consolidating NIGHT from ${walletsWithNight.length} wallet(s)...`,
     });
 
     let submittedCount = 0;
@@ -825,7 +825,7 @@ export default function Home() {
     for (const wallet of walletsWithNight) {
       setConsolidationState((prev) => ({
         ...prev,
-        lastMessage: `Enviando NIGHT desde ${formatWalletLabel(wallet)}...`,
+        lastMessage: `Sending NIGHT from ${formatWalletLabel(wallet)}...`,
       }));
       setRowAction(wallet.baseAddress, { loading: true, error: "", result: null });
 
@@ -858,7 +858,7 @@ export default function Home() {
           const message = String(data.error ?? "");
           if (
             attempt === 0 &&
-            message.includes("ADA insuficiente para cubrir el mínimo UTXO + fee")
+            message.includes("Insufficient ADA to cover the minimum UTxO plus fee")
           ) {
             const sponsorWallet = walletsRef.current
               .filter((candidate) => candidate.baseAddress !== wallet.baseAddress)
@@ -866,12 +866,12 @@ export default function Home() {
               .find((candidate) => Number(candidate.lovelace ?? 0) >= 2_100_000);
 
             if (!sponsorWallet) {
-              throw new Error("No hay otra wallet con ADA suficiente para fondear el envío de NIGHT.");
+              throw new Error("No other wallet has enough ADA to fund the NIGHT transfer.");
             }
 
             setConsolidationState((prev) => ({
               ...prev,
-              lastMessage: `Fondeando ${formatWalletLabel(wallet)} desde ${formatWalletLabel(sponsorWallet)}...`,
+              lastMessage: `Funding ${formatWalletLabel(wallet)} from ${formatWalletLabel(sponsorWallet)}...`,
             }));
 
             const topupRes = await fetch("/api/transfer", {
@@ -899,12 +899,12 @@ export default function Home() {
         }
 
         if (!transferResult) {
-          throw new Error("No se pudo construir la transferencia de NIGHT.");
+          throw new Error("Could not build the NIGHT transfer.");
         }
 
         setConsolidationState((prev) => ({
           ...prev,
-          lastMessage: `${formatWalletLabel(wallet)} enviada. Esperando confirmación...`,
+          lastMessage: `${formatWalletLabel(wallet)} submitted. Waiting for confirmation...`,
         }));
         await waitForTransactionConfirmation(transferResult.txHash);
 
@@ -913,13 +913,13 @@ export default function Home() {
         setConsolidationState((prev) => ({
           ...prev,
           submittedCount,
-          lastMessage: `${formatWalletLabel(wallet)} enviado. Siguiendo con la siguiente wallet...`,
+          lastMessage: `${formatWalletLabel(wallet)} sent. Continuing with the next wallet...`,
         }));
       } catch (e) {
         setRowAction(wallet.baseAddress, { loading: false, error: String(e), result: null });
         setConsolidationState((prev) => ({
           ...prev,
-          lastMessage: `Error en ${formatWalletLabel(wallet)}. Continuando...`,
+          lastMessage: `Error on ${formatWalletLabel(wallet)}. Continuing...`,
         }));
       }
     }
@@ -927,7 +927,7 @@ export default function Home() {
     setConsolidationState((prev) => ({
       ...prev,
       running: false,
-      lastMessage: `Consolidación enviada. ${submittedCount}/${prev.totalCount} transacciones submitidas.`,
+      lastMessage: `Consolidation submitted. ${submittedCount}/${prev.totalCount} transactions submitted.`,
     }));
     void refreshBalancesWithRetry(walletsRef.current);
   }
@@ -959,14 +959,14 @@ export default function Home() {
         <div className="mb-8 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
             <div className="mb-3 inline-flex items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] uppercase tracking-[0.24em] text-slate-400">
-              Midnight Operator Console
+              MidnightMiner Operator Console
             </div>
             <h1 className="flex items-center gap-3 text-3xl font-semibold tracking-tight text-white">
               <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-300 shadow-[0_0_18px_rgba(252,211,77,0.6)]" />
-              MidnightMiner Claimer
+              MidnightMiner-Claimer
             </h1>
             <p className="mt-2 max-w-2xl text-sm text-slate-400">
-              Derivá wallets, chequeá ADA y NIGHT, detectá rewards reclamables y mové fondos entre accounts sin salir del panel.
+              Derive wallets, inspect ADA and NIGHT, detect claimable rewards, and move funds between accounts without leaving the dashboard.
             </p>
           </div>
           <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-right">
@@ -997,7 +997,7 @@ export default function Home() {
             <div className="flex flex-wrap items-end gap-4">
               <div className="flex flex-col gap-1 min-w-72">
                 <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
-                  Sponsor para claims
+                  Claim sponsor
                 </label>
                 <select
                   value={selectedSponsorAccountIndex}
@@ -1005,7 +1005,7 @@ export default function Home() {
                   className="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm
                              text-slate-100 focus:outline-none focus:border-slate-500"
                 >
-                  <option value="auto">Auto · mejor sponsor disponible</option>
+                  <option value="auto">Auto · best available sponsor</option>
                   {sponsorOptions.map((option) => (
                     <option key={option.baseAddress} value={String(option.accountIndex)}>
                       {`Acc ${option.accountIndex} / ${option.index} · ${option.adaDisplay}`}
@@ -1014,16 +1014,16 @@ export default function Home() {
                 </select>
                 <div className="text-xs text-slate-600">
                   {sponsorsLoading
-                    ? "Cargando sponsors..."
+                    ? "Loading sponsors..."
                     : selectedSponsorOption
                       ? `${selectedSponsorOption.baseAddress.slice(0, 24)}…${selectedSponsorOption.baseAddress.slice(-8)}`
-                      : "Elige la account sponsor manualmente o usa selección automática."}
+                      : "Choose the sponsor account manually or use automatic selection."}
                 </div>
               </div>
 
               <div className="flex flex-col gap-1">
                 <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
-                  Wallets a derivar
+                  Wallets to derive
                 </label>
                 <input
                   type="number" min={1} max={50} value={count}
@@ -1035,7 +1035,7 @@ export default function Home() {
 
               <div className="flex flex-col gap-1">
                 <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
-                  Accounts a revisar
+                  Accounts to scan
                 </label>
                 <input
                   type="number" min={1} max={200} value={maxAccounts}
@@ -1047,7 +1047,7 @@ export default function Home() {
 
               <div className="flex flex-col gap-1 flex-1 min-w-48">
                 <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
-                  Blockfrost API Key <span className="text-slate-600 normal-case font-normal">(opcional si existe en .env.local)</span>
+                  Blockfrost API Key <span className="text-slate-600 normal-case font-normal">(optional if already set in .env.local)</span>
                 </label>
                 <input
                   type="password"
@@ -1076,7 +1076,7 @@ export default function Home() {
                              font-mono"
                 />
                 <div className="text-xs text-slate-600">
-                  Solo reclama wallets con al menos ese NIGHT pendiente.
+                  Only claim wallets with at least that much pending NIGHT.
                 </div>
               </div>
 
@@ -1091,38 +1091,38 @@ export default function Home() {
                   <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-                  </svg>Derivando...</>
+                  </svg>Deriving...</>
                 ) : balancesLoading ? (
                   <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-                  </svg>Cargando balances...</>
-                ) : "Derivar y ver balances"}
+                  </svg>Loading balances...</>
+                ) : "Derive and Load Balances"}
               </button>
             </div>
 
             <p className="text-xs text-slate-600">
-              Revisa <em>accounts</em> × <em>wallets</em> direcciones · Ruta m/1852&apos;/1815&apos;/acc&apos;/0/idx ·
-              Base (addr1q) para Eternl/Nami/Yoroi · Enterprise (addr1v) para MidnightMiner
+              Scans <em>accounts</em> × <em>wallets</em> addresses · Path m/1852&apos;/1815&apos;/acc&apos;/0/idx ·
+              Base (addr1q) for Eternl/Nami/Yoroi · Enterprise (addr1v) for MidnightMiner
             </p>
 
             <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
               <div className="flex flex-col gap-3 md:flex-row md:items-end">
                 <div className="flex-1">
                   <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest block mb-1.5">
-                    Consolidar todo el NIGHT a
+                    Consolidate all NIGHT to
                   </label>
                   <input
                     type="text"
                     value={consolidationAddress}
                     onChange={(e) => setConsolidationAddress(e.target.value)}
-                    placeholder="addr1... o hex"
+                    placeholder="addr1... or hex"
                     className="w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm
                                text-slate-100 placeholder-slate-600 focus:outline-none focus:border-slate-500
                                font-mono"
                   />
                   <div className="mt-1 text-xs text-slate-600">
-                    Hace una tx por wallet con NIGHT usando `amount = all`, que es lo más simple y barato posible con este modelo.
+                    Sends one transaction per wallet with NIGHT using `amount = all`, which is the simplest and cheapest approach for this flow.
                   </div>
                 </div>
                 <button
@@ -1131,13 +1131,13 @@ export default function Home() {
                   className="rounded-xl bg-violet-200 px-5 py-2 text-sm font-medium text-slate-950
                              transition-colors hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {consolidationState.running ? "Consolidando..." : "Consolidar NIGHT"}
+                  {consolidationState.running ? "Consolidating..." : "Consolidate NIGHT"}
                 </button>
               </div>
               {consolidationState.lastMessage && (
                 <div className="mt-3 text-xs text-violet-200">
                   {consolidationState.running
-                    ? `${consolidationState.submittedCount}/${consolidationState.totalCount} submitidas. `
+                    ? `${consolidationState.submittedCount}/${consolidationState.totalCount} submitted. `
                     : ""}
                   {consolidationState.lastMessage}
                 </div>
@@ -1179,8 +1179,8 @@ export default function Home() {
                 </div>
                 <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300">
                   {playState.running
-                    ? `${playState.claimedCount}/${playState.totalCount} confirmados`
-                    : `${withClaimableEligible} pendientes`}
+                    ? `${playState.claimedCount}/${playState.totalCount} confirmed`
+                    : `${withClaimableEligible} pending`}
                 </div>
               </div>
 
@@ -1207,15 +1207,15 @@ export default function Home() {
                     <><svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-                    </svg>Actualizando...</>
-                  ) : "↺ Actualizar balances"}
+                    </svg>Refreshing...</>
+                  ) : "↺ Refresh balances"}
                 </button>
               </div>
             </div>
 
             {(playState.lastMessage || playState.running) && (
               <div className="border-b border-[#1e1b3a] bg-amber-950/10 px-5 py-3 text-xs text-amber-200">
-                <span className="font-medium">{playState.running ? "Play mode activo." : "Play mode."}</span>{" "}
+                <span className="font-medium">{playState.running ? "Play mode active." : "Play mode."}</span>{" "}
                 {playState.lastMessage}
               </div>
             )}
@@ -1225,7 +1225,7 @@ export default function Home() {
               <div className="grid grid-cols-5 divide-x divide-[#1e1b3a] border-b border-[#1e1b3a]">
                 {[
                   { label: "Total wallets", value: wallets.length },
-                  { label: "Con ADA",       value: withAda },
+                  { label: "With ADA",      value: withAda },
                   { label: "Total ADA",     value: totalAda.toFixed(2) },
                   { label: "Total NIGHT",   value: totalNight.toFixed(4), hi: withNight > 0 },
                   {
@@ -1318,9 +1318,9 @@ export default function Home() {
                               className="px-3 py-1.5 text-xs bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-800
                                          text-emerald-300 hover:text-emerald-100 rounded-md transition-colors
                                          disabled:opacity-30 disabled:cursor-not-allowed"
-                              title="Enviar todo menos 1.5 ADA al siguiente account"
+                              title="Send everything except 1.5 ADA to the next account"
                             >
-                              {rowActions[w.baseAddress]?.loading ? "Procesando..." : "Pasar ADA"}
+                              {rowActions[w.baseAddress]?.loading ? "Processing..." : "Move ADA"}
                             </button>
                             <button
                               onClick={() => openTransfer(w)}
@@ -1328,9 +1328,9 @@ export default function Home() {
                               className="px-3 py-1.5 text-xs bg-[#1a1735] hover:bg-[#22204a] border border-[#2a2750]
                                          text-violet-300 hover:text-violet-100 rounded-md transition-colors
                                          disabled:opacity-30 disabled:cursor-not-allowed"
-                              title="Transferir ADA o NIGHT"
+                              title="Transfer ADA or NIGHT"
                             >
-                              Transferir
+                              Transfer
                             </button>
                             {hasClaimable && (
                               <button
@@ -1340,8 +1340,8 @@ export default function Home() {
                                            text-amber-300 hover:text-amber-100 rounded-md transition-colors
                                            disabled:opacity-30 disabled:cursor-not-allowed"
                                 title={claimAllowed
-                                  ? "Intentar claim de NIGHT"
-                                  : `Requiere al menos ${minClaimValue.toFixed(4)} NIGHT reclamable`}
+                                  ? "Attempt NIGHT claim"
+                                  : `Requires at least ${minClaimValue.toFixed(4)} claimable NIGHT`}
                               >
                                 Claim NIGHT
                               </button>
@@ -1382,7 +1382,7 @@ export default function Home() {
             </div>
 
             <div className="px-5 py-3 border-t border-[#1e1b3a] text-xs text-slate-600">
-              ADA: Koios API · NIGHT: on-chain token · Claves privadas nunca salen del servidor local
+              ADA: Koios API · NIGHT: on-chain token · Private keys never leave the local server
             </div>
           </div>
         )}

@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!validateMnemonic(cleanMnemonic)) {
-      return NextResponse.json({ error: "Mnemonic inválido" }, { status: 400 });
+      return NextResponse.json({ error: "Invalid mnemonic" }, { status: 400 });
     }
 
     const blockfrostKey =

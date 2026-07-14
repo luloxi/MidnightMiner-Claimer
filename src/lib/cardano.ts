@@ -17,6 +17,10 @@ export const NIGHT_NAME   = "4e49474854"; // hex of "NIGHT"
 
 // ── Derivation types ───────────────────────────────────────────────────────
 
+/** The thaw API is keyed per payment address, so every address a wallet can produce must be checked. */
+export type AddressChain = 0 | 1; // 0 = external, 1 = change
+export type AddressKind = "base" | "enterprise";
+
 export interface DerivedWallet {
   index: number;
   accountIndex: number;
@@ -24,8 +28,24 @@ export interface DerivedWallet {
   baseAddressHex: string;
   enterpriseAddress: string;
   enterpriseAddressHex: string;
+  changeAddress: string;
+  changeAddressHex: string;
+  changeEnterpriseAddress: string;
+  changeEnterpriseAddressHex: string;
   pubkeyHex: string;
   stakeAddress: string;
+}
+
+/** Every (chain, kind) address for one wallet, in the order they should be scanned. */
+export function addressVariants(
+  wallet: DerivedWallet
+): { chain: AddressChain; kind: AddressKind; address: string }[] {
+  return [
+    { chain: 0, kind: "base",       address: wallet.baseAddress },
+    { chain: 0, kind: "enterprise", address: wallet.enterpriseAddress },
+    { chain: 1, kind: "base",       address: wallet.changeAddress },
+    { chain: 1, kind: "enterprise", address: wallet.changeEnterpriseAddress },
+  ];
 }
 
 export async function deriveWalletsMultiAccount(
@@ -67,35 +87,53 @@ export async function deriveWallets(
   const stakeAddr = lib.RewardAddress.new(1, CredCls.from_keyhash(stakeKeyHash))
     .to_address().to_bech32();
 
+  const stakeCred = CredCls.from_keyhash(stakeKeyHash);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const addressesFor = (chain: AddressChain, i: number): { pubKey: any; base: any; enterprise: any } => {
+    const pubKey      = accountKey.derive(chain).derive(i).to_public().to_raw_key();
+    const paymentCred = CredCls.from_keyhash(pubKey.hash());
+    return {
+      pubKey,
+      base:       lib.BaseAddress.new(1, paymentCred, stakeCred).to_address(),
+      enterprise: lib.EnterpriseAddress.new(1, paymentCred).to_address(),
+    };
+  };
+
   const results: DerivedWallet[] = [];
   for (let i = 0; i < count; i++) {
-    const paymentKey     = accountKey.derive(0).derive(i);
-    const pubKey         = paymentKey.to_public().to_raw_key();
-    const paymentKeyHash = pubKey.hash();
-    const paymentCred    = CredCls.from_keyhash(paymentKeyHash);
-    const stakeCred      = CredCls.from_keyhash(stakeKeyHash);
-    const baseAddr       = lib.BaseAddress.new(1, paymentCred, stakeCred).to_address();
-    const entAddr        = lib.EnterpriseAddress.new(1, paymentCred).to_address();
+    const external = addressesFor(0, i);
+    const change   = addressesFor(1, i);
 
     results.push({
       index: i,
       accountIndex,
-      baseAddress:       baseAddr.to_bech32(),
-      baseAddressHex:    Buffer.from(baseAddr.to_bytes()).toString("hex"),
-      enterpriseAddress: entAddr.to_bech32(),
-      enterpriseAddressHex: Buffer.from(entAddr.to_bytes()).toString("hex"),
-      pubkeyHex: Buffer.from(pubKey.as_bytes()).toString("hex"),
+      baseAddress:          external.base.to_bech32(),
+      baseAddressHex:       Buffer.from(external.base.to_bytes()).toString("hex"),
+      enterpriseAddress:    external.enterprise.to_bech32(),
+      enterpriseAddressHex: Buffer.from(external.enterprise.to_bytes()).toString("hex"),
+      changeAddress:              change.base.to_bech32(),
+      changeAddressHex:           Buffer.from(change.base.to_bytes()).toString("hex"),
+      changeEnterpriseAddress:    change.enterprise.to_bech32(),
+      changeEnterpriseAddressHex: Buffer.from(change.enterprise.to_bytes()).toString("hex"),
+      pubkeyHex: Buffer.from(external.pubKey.as_bytes()).toString("hex"),
       stakeAddress: stakeAddr,
     });
   }
   return results;
 }
 
-/** Derive the raw signing key (hex) for a specific account/index — used for transactions. */
+/**
+ * Derive the raw signing key (hex) for a specific account/chain/index — used for transactions.
+ * `baseAddressHex` is the address the key controls, which for kind "enterprise" is the
+ * enterprise form of the same payment credential.
+ */
 export async function deriveSigningKey(
   mnemonic: string,
   accountIndex: number,
-  addressIndex = 0
+  addressIndex = 0,
+  chain: AddressChain = 0,
+  kind: AddressKind = "base"
 ): Promise<{ signingKeyHex: string; baseAddressHex: string }> {
   const { mnemonicToEntropy } = await import("bip39");
   const lib = await csl();
@@ -107,18 +145,18 @@ export async function deriveSigningKey(
   const accountKey = rootKey
     .derive(harden(1852)).derive(harden(1815)).derive(harden(accountIndex));
 
-  const paymentKey     = accountKey.derive(0).derive(addressIndex);
+  const paymentKey     = accountKey.derive(chain).derive(addressIndex);
   const stakeKey       = accountKey.derive(2).derive(0);
   const CredCls        = lib.Credential ?? lib.StakeCredential;
-  const paymentKeyHash = paymentKey.to_public().to_raw_key().hash();
-  const stakeKeyHash   = stakeKey.to_public().to_raw_key().hash();
-  const baseAddr       = lib.BaseAddress.new(
-    1, CredCls.from_keyhash(paymentKeyHash), CredCls.from_keyhash(stakeKeyHash)
-  ).to_address();
+  const paymentCred    = CredCls.from_keyhash(paymentKey.to_public().to_raw_key().hash());
+  const stakeCred      = CredCls.from_keyhash(stakeKey.to_public().to_raw_key().hash());
+  const addr           = kind === "enterprise"
+    ? lib.EnterpriseAddress.new(1, paymentCred).to_address()
+    : lib.BaseAddress.new(1, paymentCred, stakeCred).to_address();
 
   return {
     signingKeyHex:   Buffer.from(paymentKey.to_raw_key().as_bytes()).toString("hex"),
-    baseAddressHex:  Buffer.from(baseAddr.to_bytes()).toString("hex"),
+    baseAddressHex:  Buffer.from(addr.to_bytes()).toString("hex"),
   };
 }
 

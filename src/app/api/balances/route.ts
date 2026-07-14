@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { BlockfrostUtxo } from "@/lib/cardano";
+import {
+  addressVariants,
+  AddressChain,
+  AddressKind,
+  BlockfrostUtxo,
+  DerivedWallet,
+} from "@/lib/cardano";
 
 const KOIOS_API    = "https://api.koios.rest/api/v1";
 const BF_API       = "https://cardano-mainnet.blockfrost.io/api/v0";
@@ -53,6 +59,12 @@ export interface WalletBalance {
   adaDisplay: string;
   nightDisplay: string;
   claimableDisplay: string;
+  claimTargets: ClaimTarget[];
+  nextThawAt: string | null;
+  upcomingNight: string;
+  skippedNight: string;
+  failedNight: string;
+  lookupFailed: boolean;
 }
 
 async function bf(path: string, apiKey: string) {
@@ -64,25 +76,29 @@ async function bf(path: string, apiKey: string) {
   return res.json();
 }
 
-interface MidnightBuildResponse {
-  redeemed_amount?: number;
-  message?: string;
-  type?: string;
+/**
+ * A thaw tranche. Observed statuses:
+ *   upcoming   — not matured yet
+ *   redeemable — matured and unclaimed: this is what "claimable" means
+ *   confirmed  — already claimed on-chain
+ *   skipped    — window passed unclaimed; the amount rolls into the next tranche
+ *   failed     — a claim was attempted and did not land
+ */
+interface MidnightThaw {
+  amount?: number;
+  status?: string;
+  thawing_period_start?: string;
+  transaction_id?: string | null;
 }
 
 interface MidnightThawSchedule {
-  thaws?: Array<{
-    amount?: number;
-    status?: string;
-    transaction_id?: string | null;
-  }>;
+  thaws?: MidnightThaw[];
 }
 
-interface FundingSource {
-  address: string;
-  utxos: BlockfrostUtxo[];
-  fundingUtxos: string[];
-}
+type ScheduleResult =
+  | { state: "ok"; thaws: MidnightThaw[] }
+  | { state: "none" }              // address has no allocation — a real zero
+  | { state: "error"; reason: string }; // lookup failed — NOT a zero
 
 function midnightHeaders() {
   return {
@@ -102,161 +118,127 @@ function midnightHeaders() {
   };
 }
 
-async function toCborFundingUtxos(address: string, utxos: BlockfrostUtxo[]) {
-  const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
-  const outputAddr = lib.Address.from_bech32(address);
+/**
+ * The schedule endpoint is the authority on what is claimable, and it needs no Blockfrost key.
+ * A transport failure must never be reported as "nothing to claim", so it is surfaced as an error.
+ */
+async function fetchSchedule(address: string): Promise<ScheduleResult> {
+  let lastReason = "unknown";
 
-  return utxos.map((utxo) => {
-    const value = lib.Value.new(
-      lib.BigNum.from_str(
-        utxo.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0"
-      )
-    );
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(`${MIDNIGHT_THAW_API}/thaws/${address}/schedule`, {
+        method: "GET",
+        headers: midnightHeaders(),
+        signal: AbortSignal.timeout(20_000),
+      });
 
-    const byPolicy = new Map<string, { unit: string; quantity: string }[]>();
-    for (const amount of utxo.amount) {
-      if (amount.unit === "lovelace") continue;
-      const policy = amount.unit.slice(0, 56);
-      const list = byPolicy.get(policy) ?? [];
-      list.push(amount);
-      byPolicy.set(policy, list);
-    }
-
-    if (byPolicy.size > 0) {
-      const multiAsset = lib.MultiAsset.new();
-      for (const [policy, assetsForPolicy] of byPolicy.entries()) {
-        const scriptHash = lib.ScriptHash.from_bytes(Buffer.from(policy, "hex"));
-        const assets = lib.Assets.new();
-        for (const asset of assetsForPolicy) {
-          const assetHex = asset.unit.slice(56);
-          const assetName = lib.AssetName.new(Buffer.from(assetHex, "hex"));
-          assets.insert(assetName, lib.BigNum.from_str(asset.quantity));
-        }
-        multiAsset.insert(scriptHash, assets);
+      if (res.ok) {
+        const data = await res.json() as MidnightThawSchedule;
+        return { state: "ok", thaws: data.thaws ?? [] };
       }
-      value.set_multiasset(multiAsset);
+
+      const body = await res.json().catch(() => null) as { type?: string } | null;
+      // "no allocation for this address" is a definitive zero, not a failure.
+      if (body?.type === "no_redeemable_thaws") return { state: "none" };
+
+      lastReason = `HTTP ${res.status}${body?.type ? ` (${body.type})` : ""}`;
+      if (res.status < 500 && res.status !== 429) return { state: "error", reason: lastReason };
+    } catch (err) {
+      lastReason = String(err);
     }
 
-    const txInput = lib.TransactionInput.new(
-      lib.TransactionHash.from_hex(utxo.tx_hash),
-      utxo.tx_index
-    );
-    const txOutput = lib.TransactionOutput.new(outputAddr, value);
-    const txUnspent = lib.TransactionUnspentOutput.new(txInput, txOutput);
-    return Buffer.from(txUnspent.to_bytes()).toString("hex");
-  });
-}
-
-async function buildMidnightClaimPreview(
-  thawAddress: string,
-  fundingSource: FundingSource
-): Promise<{ ok: true; redeemedAmount: bigint } | { ok: false; retryable: boolean }> {
-  const res = await fetch(`${MIDNIGHT_THAW_API}/thaws/${thawAddress}/transactions/build`, {
-    method: "POST",
-    headers: midnightHeaders(),
-    body: JSON.stringify({
-      change_address: fundingSource.address,
-      collateral_utxos: [],
-      funding_utxos: fundingSource.fundingUtxos,
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  let data: MidnightBuildResponse | null = null;
-  try {
-    data = await res.json() as MidnightBuildResponse;
-  } catch {
-    data = null;
+    await new Promise((resolve) => setTimeout(resolve, 400 * 2 ** attempt));
   }
 
-  if (res.ok) {
-    return { ok: true, redeemedAmount: BigInt(data?.redeemed_amount ?? 0) };
-  }
-
-  const message = `${data?.message ?? ""} ${data?.type ?? ""}`.toLowerCase();
-  const retryable =
-    message.includes("not enough funds") ||
-    message.includes("missing amount");
-
-  return { ok: false, retryable };
+  return { state: "error", reason: lastReason };
 }
 
-async function fetchClaimableFromSchedule(address: string): Promise<bigint | null> {
-  const res = await fetch(`${MIDNIGHT_THAW_API}/thaws/${address}/schedule`, {
-    method: "GET",
-    headers: midnightHeaders(),
-    signal: AbortSignal.timeout(20_000),
-  });
-
-  if (!res.ok) return null;
-
-  const data = await res.json() as MidnightThawSchedule;
-  const redeemable = (data.thaws ?? []).reduce((sum, thaw) => {
-    if (thaw.status !== "redeemable") return sum;
-    return sum + BigInt(thaw.amount ?? 0);
-  }, BigInt(0));
-
-  return redeemable;
+interface ClaimTarget {
+  chain: AddressChain;
+  kind: AddressKind;
+  address: string;
+  redeemable: string;
 }
 
-async function loadFundingSource(
-  address: string,
-  blockfrostKey: string,
-  cache: Map<string, Promise<FundingSource | null>>
-): Promise<FundingSource | null> {
-  let existing = cache.get(address);
-  if (!existing) {
-    existing = (async () => {
-      const utxos = await bf(`/addresses/${address}/utxos`, blockfrostKey) as BlockfrostUtxo[] | null;
-      if (!utxos?.length) return null;
-      return {
-        address,
-        utxos,
-        fundingUtxos: await toCborFundingUtxos(address, utxos),
-      };
-    })();
-    cache.set(address, existing);
-  }
-  return existing;
+interface WalletThawSummary {
+  claimable: bigint;
+  upcoming: bigint;
+  skipped: bigint;
+  failed: bigint;
+  nextThawAt: string | null;
+  targets: ClaimTarget[];
+  lookupFailed: boolean;
 }
 
-async function fetchClaimableNight(
-  address: string,
-  blockfrostKey: string,
-  sponsorAddresses: string[],
-  fundingCache: Map<string, Promise<FundingSource | null>>
-): Promise<bigint> {
-  const scheduledClaimable = await fetchClaimableFromSchedule(address);
-  if (scheduledClaimable !== null) return scheduledClaimable;
+/** Scan every address a wallet can produce — the thaw API is keyed per payment address. */
+async function fetchWalletThaws(wallet: DerivedWallet): Promise<WalletThawSummary> {
+  const summary: WalletThawSummary = {
+    claimable: BigInt(0),
+    upcoming: BigInt(0),
+    skipped: BigInt(0),
+    failed: BigInt(0),
+    nextThawAt: null,
+    targets: [],
+    lookupFailed: false,
+  };
 
-  const candidates = [address, ...sponsorAddresses.filter((candidate) => candidate !== address)];
+  for (const variant of addressVariants(wallet)) {
+    const result = await fetchSchedule(variant.address);
+    if (result.state === "error") {
+      summary.lookupFailed = true;
+      continue;
+    }
+    if (result.state === "none") continue;
 
-  for (const candidateAddress of candidates) {
-    const fundingSource = await loadFundingSource(candidateAddress, blockfrostKey, fundingCache);
-    if (!fundingSource) continue;
+    let redeemableHere = BigInt(0);
+    for (const thaw of result.thaws) {
+      const amount = BigInt(thaw.amount ?? 0);
+      switch (thaw.status) {
+        case "redeemable":
+          redeemableHere += amount;
+          break;
+        case "upcoming":
+          summary.upcoming += amount;
+          if (
+            thaw.thawing_period_start &&
+            (!summary.nextThawAt || thaw.thawing_period_start < summary.nextThawAt)
+          ) {
+            summary.nextThawAt = thaw.thawing_period_start;
+          }
+          break;
+        case "skipped":
+          summary.skipped += amount;
+          break;
+        case "failed":
+          summary.failed += amount;
+          break;
+      }
+    }
 
-    const preview = await buildMidnightClaimPreview(address, fundingSource);
-    if (preview.ok) return preview.redeemedAmount;
-    if (!preview.retryable) return BigInt(0);
+    if (redeemableHere > BigInt(0)) {
+      summary.claimable += redeemableHere;
+      summary.targets.push({
+        chain: variant.chain,
+        kind: variant.kind,
+        address: variant.address,
+        redeemable: redeemableHere.toString(),
+      });
+    }
   }
 
-  return BigInt(0);
+  return summary;
 }
 
 /**
  * POST /api/balances
  * Checks ADA + on-chain NIGHT token via Koios in batches of 10.
  * Checks both base (addr1q) and enterprise (addr1v) addresses per wallet.
+ * Thaw schedules are checked on all four addresses per wallet (external + change, base + enterprise).
  */
 export async function POST(req: NextRequest) {
-  const { wallets, sponsorAddress, blockfrostApiKey } = await req.json() as {
-    wallets: {
-      index: number;
-      baseAddress: string;
-      baseAddressHex: string;
-      enterpriseAddress: string;
-      enterpriseAddressHex: string;
-    }[];
+  const { wallets, blockfrostApiKey } = await req.json() as {
+    wallets: DerivedWallet[];
     sponsorAddress?: string;
     blockfrostApiKey?: string;
   };
@@ -328,40 +310,11 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const claimableEntries = await (async () => {
-      const autoSponsorAddresses = [
-        ...wallets
-        .map((w) => ({
-          address: w.baseAddress,
-          baseLovelace: BigInt(adaMap[w.baseAddress] ?? "0"),
-        }))
-        .filter((entry) => entry.baseLovelace > BigInt(0))
-        .sort((a, b) => (a.baseLovelace > b.baseLovelace ? -1 : a.baseLovelace < b.baseLovelace ? 1 : 0))
-        .map((entry) => entry.address),
-      ].filter((address, index, arr) => arr.indexOf(address) === index);
-
-      const sponsorAddresses = sponsorAddress
-        ? [sponsorAddress]
-        : autoSponsorAddresses;
-
-      const fundingCache = new Map<string, Promise<FundingSource | null>>();
-
-      return Promise.all(wallets.map(async (w) => {
-        if (!blockfrostKey) return [w.baseAddress, BigInt(0)] as const;
-        try {
-          const claimable = await fetchClaimableNight(
-            w.baseAddress,
-            blockfrostKey,
-            sponsorAddresses,
-            fundingCache
-          );
-          return [w.baseAddress, claimable] as const;
-        } catch {
-          return [w.baseAddress, BigInt(0)] as const;
-        }
-      }));
-    })();
-  const claimableMap = Object.fromEntries(claimableEntries);
+  // Thaw lookups are independent of Blockfrost — a missing key must not zero out the claimable column.
+  const thawEntries = await Promise.all(
+    wallets.map(async (w) => [w.baseAddress, await fetchWalletThaws(w)] as const)
+  );
+  const thawMap = Object.fromEntries(thawEntries) as Record<string, WalletThawSummary>;
 
   const balances: WalletBalance[] = wallets.map(w => {
     const baseLov  = BigInt(adaMap[w.baseAddress]      ?? "0");
@@ -371,7 +324,8 @@ export async function POST(req: NextRequest) {
     const baseNight  = nightMap[w.baseAddress]       ?? BigInt(0);
     const entNight   = nightMap[w.enterpriseAddress]  ?? BigInt(0);
     const totalNight = baseNight + entNight;
-    const claimableNight = claimableMap[w.baseAddress] ?? BigInt(0);
+    const thaws = thawMap[w.baseAddress];
+    const claimableNight = thaws.claimable;
 
     // ADA display:
     //   "—"          → Koios API not reachable at all
@@ -385,9 +339,13 @@ export async function POST(req: NextRequest) {
     const nightDisplay = totalNight > BigInt(0)
       ? (Number(totalNight) / NIGHT_DECIMALS).toFixed(4) + " NIGHT"
       : "0 NIGHT";
+
+    // "—" means the lookup failed: unknown, which is not the same as zero.
     const claimableDisplay = claimableNight > BigInt(0)
       ? (Number(claimableNight) / NIGHT_DECIMALS).toFixed(6) + " NIGHT"
-      : "0 NIGHT";
+      : thaws.lookupFailed
+        ? "—"
+        : "0 NIGHT";
 
     return {
       index: w.index,
@@ -399,6 +357,12 @@ export async function POST(req: NextRequest) {
       adaDisplay,
       nightDisplay,
       claimableDisplay,
+      claimTargets: thaws.targets,
+      nextThawAt: thaws.nextThawAt,
+      upcomingNight: thaws.upcoming.toString(),
+      skippedNight: thaws.skipped.toString(),
+      failedNight: thaws.failed.toString(),
+      lookupFailed: thaws.lookupFailed,
     };
   });
 

@@ -2,6 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 
+interface ClaimTarget {
+  chain: 0 | 1;
+  kind: "base" | "enterprise";
+  address: string;
+  redeemable: string;
+}
+
 interface Wallet {
   index: number;
   accountIndex: number;
@@ -9,6 +16,10 @@ interface Wallet {
   baseAddressHex: string;
   enterpriseAddress: string;
   enterpriseAddressHex: string;
+  changeAddress: string;
+  changeAddressHex: string;
+  changeEnterpriseAddress: string;
+  changeEnterpriseAddressHex: string;
   pubkeyHex: string;
   stakeAddress: string;
   // balances
@@ -18,6 +29,13 @@ interface Wallet {
   adaDisplay?: string;
   nightDisplay?: string;
   claimableDisplay?: string;
+  // thaw schedule
+  claimTargets?: ClaimTarget[];
+  nextThawAt?: string | null;
+  upcomingNight?: string;
+  skippedNight?: string;
+  failedNight?: string;
+  lookupFailed?: boolean;
 }
 
 interface SponsorOption {
@@ -382,6 +400,12 @@ export default function Home() {
             adaDisplay: b.adaDisplay,
             nightDisplay: b.nightDisplay,
             claimableDisplay: b.claimableDisplay,
+            claimTargets: b.claimTargets,
+            nextThawAt: b.nextThawAt,
+            upcomingNight: b.upcomingNight,
+            skippedNight: b.skippedNight,
+            failedNight: b.failedNight,
+            lookupFailed: b.lookupFailed,
           } : w;
         });
       confirmedClaimsRef.current = new Set(
@@ -476,6 +500,19 @@ export default function Home() {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
 
+  /** Explains an empty claimable cell: nothing to claim is not the same as nothing allocated. */
+  function describeSchedule(wallet: Wallet) {
+    if (Number(wallet.claimableNight ?? 0) > 0) return "";
+    if (wallet.lookupFailed) return "retry to re-check";
+
+    const upcoming = Number(wallet.upcomingNight ?? 0) / 1_000_000;
+    if (upcoming > 0 && wallet.nextThawAt) {
+      const date = wallet.nextThawAt.slice(0, 10);
+      return `next thaw ${date} · ${upcoming.toFixed(2)} NIGHT`;
+    }
+    return "";
+  }
+
   function canClaimWallet(wallet: Wallet) {
     return (
       getClaimableNightDisplayValue(wallet) >= getMinClaimNightValue() &&
@@ -540,39 +577,52 @@ export default function Home() {
   async function claimNightAndWait(w: Wallet) {
     setRowAction(w.baseAddress, { loading: true, error: "", result: null });
     try {
-      const res = await fetch("/api/claim", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mnemonic,
-          fromAccountIndex: w.accountIndex,
-          fromAddressIndex: w.index,
-          blockfrostApiKey: blockfrostKey,
-          sponsorAccountIndex:
-            selectedSponsorAccountIndex === "auto"
-              ? null
-              : Number(selectedSponsorAccountIndex),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      // A thaw is registered per payment address, so a wallet can have redeemable amounts on
+      // several of its addresses (external/change, base/enterprise). Claim each of them.
+      const targets: ClaimTarget[] = w.claimTargets?.length
+        ? w.claimTargets
+        : [{ chain: 0, kind: "base", address: w.baseAddress, redeemable: w.claimableNight ?? "0" }];
 
-      setPlayState((prev) => ({
-        ...prev,
-        lastMessage: `${formatWalletLabel(w)} submitted. Waiting for confirmation...`,
-      }));
+      let lastData: { txHash: string; explorerUrl: string; redeemedAmount?: number } | null = null;
 
-      await waitForTransactionConfirmation(data.txHash);
+      for (const target of targets) {
+        const res = await fetch("/api/claim", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mnemonic,
+            fromAccountIndex: w.accountIndex,
+            fromAddressIndex: w.index,
+            fromChain: target.chain,
+            fromAddressKind: target.kind,
+            blockfrostApiKey: blockfrostKey,
+            sponsorAccountIndex:
+              selectedSponsorAccountIndex === "auto"
+                ? null
+                : Number(selectedSponsorAccountIndex),
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+
+        setPlayState((prev) => ({
+          ...prev,
+          lastMessage: `${formatWalletLabel(w)} submitted. Waiting for confirmation...`,
+        }));
+
+        await waitForTransactionConfirmation(data.txHash);
+        lastData = data;
+      }
+
+      if (!lastData) throw new Error("Nothing claimable was found for this wallet");
 
       confirmedClaimsRef.current = new Set(confirmedClaimsRef.current).add(w.baseAddress);
-      setRowAction(w.baseAddress, { loading: false, result: data, error: "" });
+      setRowAction(w.baseAddress, { loading: false, result: lastData, error: "" });
 
       void fetchSponsors();
       void refreshBalancesWithRetry(walletsRef.current);
 
-      return {
-        result: data as { txHash: string; explorerUrl: string; redeemedAmount?: number },
-      };
+      return { result: lastData };
     } catch (e) {
       const message = String(e);
       setRowAction(w.baseAddress, { loading: false, error: message });
@@ -1304,9 +1354,18 @@ export default function Home() {
                                 : <span className="text-slate-600">0 NIGHT</span>}
                             </td>
                             <td className="px-4 py-3 text-right whitespace-nowrap">
-                              {hasClaimable
-                                ? <span className="text-amber-300 font-semibold">{w.claimableDisplay}</span>
-                                : <span className="text-slate-600">0 NIGHT</span>}
+                              {hasClaimable ? (
+                                <span className="text-amber-300 font-semibold">{w.claimableDisplay}</span>
+                              ) : w.lookupFailed ? (
+                                <span className="text-rose-400" title="The thaw lookup failed — this is not the same as zero">
+                                  lookup failed
+                                </span>
+                              ) : (
+                                <span className="text-slate-600">0 NIGHT</span>
+                              )}
+                              {describeSchedule(w) && (
+                                <div className="text-[10px] text-slate-500 mt-0.5">{describeSchedule(w)}</div>
+                              )}
                             </td>
                           </>
                         )}

@@ -1,10 +1,46 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validateMnemonic } from "bip39";
-import { deriveSigningKey, deriveWalletsMultiAccount, BlockfrostUtxo } from "@/lib/cardano";
+import {
+  AddressChain,
+  AddressKind,
+  BlockfrostUtxo,
+  deriveSigningKey,
+  deriveWalletsMultiAccount,
+} from "@/lib/cardano";
 
 const BF = "https://cardano-mainnet.blockfrost.io/api/v0";
 const MIDNIGHT_THAW_API = "https://mainnet.prod.gd.midnighttge.io";
 const GLOBAL_SPONSOR_SCAN_ACCOUNTS = 25;
+
+/**
+ * The thaw build endpoint reuses the funding UTxOs as collateral when none is supplied, and
+ * collateral is capped at 3 inputs. Sending more is rejected with `invalid_number_of_inputs`.
+ */
+const MAX_FUNDING_UTXOS = 3;
+
+/**
+ * The funding address pays the min-ADA of the redeemed NIGHT output plus the fee. Below roughly
+ * 2 ADA the endpoint fails with TxBodyErrorAdaBalanceTooSmall, so poor addresses are skipped in
+ * favour of a sponsor that can actually cover it.
+ */
+const MIN_FUNDING_LOVELACE = BigInt(3_000_000);
+
+/** Pick the funding UTxOs to send: biggest first, pure-ADA preferred, never more than the cap. */
+function selectFundingUtxos(utxos: BlockfrostUtxo[]): { selected: BlockfrostUtxo[]; lovelace: bigint } {
+  const lovelaceOf = (u: BlockfrostUtxo) =>
+    BigInt(u.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0");
+  const byValueDesc = (a: BlockfrostUtxo, b: BlockfrostUtxo) =>
+    lovelaceOf(a) > lovelaceOf(b) ? -1 : lovelaceOf(a) < lovelaceOf(b) ? 1 : 0;
+
+  const pureAda = utxos.filter((u) => u.amount.length === 1).sort(byValueDesc);
+  const withTokens = utxos.filter((u) => u.amount.length > 1).sort(byValueDesc);
+
+  const selected = [...pureAda, ...withTokens].slice(0, MAX_FUNDING_UTXOS);
+  return {
+    selected,
+    lovelace: selected.reduce((sum, u) => sum + lovelaceOf(u), BigInt(0)),
+  };
+}
 
 async function bf(path: string, apiKey: string) {
   const res = await fetch(`${BF}${path}`, {
@@ -228,12 +264,11 @@ async function deriveAutoSponsorCandidates(
   const candidates = await Promise.all(
     sponsorWallets.map(async (wallet) => {
       const utxos = await bfMaybe(`/addresses/${wallet.baseAddress}/utxos`, blockfrostApiKey) as BlockfrostUtxo[] | null;
-      const lovelace = (utxos ?? []).reduce((sum, utxo) => {
-        const quantity = utxo.amount.find((amount) => amount.unit === "lovelace")?.quantity ?? "0";
-        return sum + BigInt(quantity);
-      }, BigInt(0));
+      // Rank by the ADA that can actually be sent as funding, not the full balance: only the
+      // largest MAX_FUNDING_UTXOS are usable, so a big balance split across dust is not a sponsor.
+      const { lovelace } = selectFundingUtxos(utxos ?? []);
 
-      if (lovelace <= BigInt(0)) return null;
+      if (lovelace < MIN_FUNDING_LOVELACE) return null;
 
       const { signingKeyHex } = await deriveSigningKey(
         sponsorMnemonic,
@@ -266,12 +301,16 @@ export async function POST(req: NextRequest) {
       mnemonic,
       fromAccountIndex,
       fromAddressIndex = 0,
+      fromChain = 0,
+      fromAddressKind = "base",
       blockfrostApiKey,
       sponsorAccountIndex,
     } = await req.json() as {
       mnemonic: string;
       fromAccountIndex: number;
       fromAddressIndex?: number;
+      fromChain?: AddressChain;
+      fromAddressKind?: AddressKind;
       blockfrostApiKey?: string;
       sponsorAccountIndex?: number | null;
     };
@@ -289,7 +328,9 @@ export async function POST(req: NextRequest) {
     const { signingKeyHex, baseAddressHex } = await deriveSigningKey(
       mnemonic.trim(),
       fromAccountIndex,
-      fromAddressIndex
+      fromAddressIndex,
+      fromChain,
+      fromAddressKind
     );
 
     const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
@@ -362,8 +403,17 @@ export async function POST(req: NextRequest) {
 
         if (!fundingUtxosRaw?.length) continue;
 
+        const { selected, lovelace } = selectFundingUtxos(fundingUtxosRaw);
+        if (lovelace < MIN_FUNDING_LOVELACE) {
+          // Too poor to cover min-ADA + fee; a sponsor further down the list can.
+          lastBuildError =
+            `${candidate.address} has only ${(Number(lovelace) / 1_000_000).toFixed(2)} ADA available ` +
+            `in its ${MAX_FUNDING_UTXOS} largest UTxOs, which cannot cover the claim`;
+          continue;
+        }
+
         try {
-          const fundingUtxos = await toCborFundingUtxos(candidate.address, fundingUtxosRaw);
+          const fundingUtxos = await toCborFundingUtxos(candidate.address, selected);
           build = await buildClaimTx(senderBech32, candidate.address, fundingUtxos);
           signedTxHex = await signBuiltTransaction(
             build.transaction,

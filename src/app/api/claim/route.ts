@@ -5,6 +5,7 @@ import {
   AddressKind,
   BlockfrostUtxo,
   deriveSigningKey,
+  deriveWallets,
   deriveWalletsMultiAccount,
 } from "@/lib/cardano";
 
@@ -78,7 +79,10 @@ interface SponsorCandidate {
   accountIndex: number | null;
   address: string;
   signingKeyHexes: string[];
+  utxos?: BlockfrostUtxo[] | null;
 }
+
+type UtxoCache = Map<string, Promise<BlockfrostUtxo[] | null>>;
 
 interface NoRedeemableThawsInfo {
   nextThawAt: string | null;
@@ -218,6 +222,33 @@ async function signBuiltTransaction(txHex: string, signingKeyHexes: string[]) {
   ).toString("hex");
 }
 
+async function loadUtxos(
+  address: string,
+  blockfrostApiKey: string,
+  cache: UtxoCache
+): Promise<BlockfrostUtxo[] | null> {
+  let existing = cache.get(address);
+  if (!existing) {
+    existing = bfMaybe(`/addresses/${address}/utxos`, blockfrostApiKey) as Promise<BlockfrostUtxo[] | null>;
+    cache.set(address, existing);
+  }
+  return existing;
+}
+
+function normalizeAccountIndexes(input: unknown): number[] {
+  if (!Array.isArray(input)) return [];
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const value of input) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
 async function waitForValidityWindow(txHex: string, blockfrostApiKey: string) {
   const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
   const tx = lib.Transaction.from_bytes(Buffer.from(txHex, "hex"));
@@ -231,41 +262,41 @@ async function waitForValidityWindow(txHex: string, blockfrostApiKey: string) {
 
   const targetSlot = Number(invalidBefore);
   if (!Number.isFinite(targetSlot)) return;
-  const safetySlots = 1;
-  const requiredSlot = targetSlot + safetySlots;
+  const requiredSlot = targetSlot + 1;
 
-  for (let i = 0; i < 24; i++) {
-    const latestBlock = await bf("/blocks/latest", blockfrostApiKey);
-    const currentSlot = Number(latestBlock.slot ?? 0);
-    if (currentSlot >= requiredSlot) return;
+  const latestBlock = await bf("/blocks/latest", blockfrostApiKey);
+  const currentSlot = Number(latestBlock.slot ?? 0);
+  if (currentSlot >= requiredSlot) return;
 
-    const waitMs = Math.min(Math.max(requiredSlot - currentSlot, 1) * 1_000, 10_000);
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  const waitMs = Math.min(Math.max(requiredSlot - currentSlot, 1) * 1_000 + 400, 25_000);
+  await sleep(waitMs);
+
+  const check = await bf("/blocks/latest", blockfrostApiKey);
+  const slotAfterWait = Number(check.slot ?? 0);
+  if (slotAfterWait >= requiredSlot) return;
+
+  if (slotAfterWait < requiredSlot) {
+    await sleep(Math.min(Math.max(requiredSlot - slotAfterWait, 1) * 1_000 + 400, 8_000));
   }
-
-  throw new Error(
-    `The transaction did not reach its validity window in time (required slot ${requiredSlot})`
-  );
 }
 
 async function deriveAutoSponsorCandidates(
   sponsorMnemonic: string,
   targetSigningKeyHex: string,
-  blockfrostApiKey: string
+  blockfrostApiKey: string,
+  utxoCache: UtxoCache
 ): Promise<SponsorCandidate[]> {
   if (!sponsorMnemonic) return [];
 
-    const sponsorWallets = await deriveWalletsMultiAccount(
-      sponsorMnemonic,
-      1,
+  const sponsorWallets = await deriveWalletsMultiAccount(
+    sponsorMnemonic,
+    1,
     GLOBAL_SPONSOR_SCAN_ACCOUNTS
   );
 
   const candidates = await Promise.all(
     sponsorWallets.map(async (wallet) => {
-      const utxos = await bfMaybe(`/addresses/${wallet.baseAddress}/utxos`, blockfrostApiKey) as BlockfrostUtxo[] | null;
-      // Rank by the ADA that can actually be sent as funding, not the full balance: only the
-      // largest MAX_FUNDING_UTXOS are usable, so a big balance split across dust is not a sponsor.
+      const utxos = await loadUtxos(wallet.baseAddress, blockfrostApiKey, utxoCache);
       const { lovelace } = selectFundingUtxos(utxos ?? []);
 
       if (lovelace < MIN_FUNDING_LOVELACE) return null;
@@ -281,6 +312,7 @@ async function deriveAutoSponsorCandidates(
         address: wallet.baseAddress,
         lovelace,
         signingKeyHexes: [signingKeyHex, targetSigningKeyHex],
+        utxos,
       };
     })
   );
@@ -288,10 +320,11 @@ async function deriveAutoSponsorCandidates(
   return candidates
     .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
     .sort((a, b) => (a.lovelace > b.lovelace ? -1 : a.lovelace < b.lovelace ? 1 : 0))
-    .map(({ accountIndex, address, signingKeyHexes }) => ({
+    .map(({ accountIndex, address, signingKeyHexes, utxos }) => ({
       accountIndex,
       address,
       signingKeyHexes,
+      utxos,
     }));
 }
 
@@ -305,6 +338,7 @@ export async function POST(req: NextRequest) {
       fromAddressKind = "base",
       blockfrostApiKey,
       sponsorAccountIndex,
+      sponsorAccountIndexes,
     } = await req.json() as {
       mnemonic: string;
       fromAccountIndex: number;
@@ -313,6 +347,7 @@ export async function POST(req: NextRequest) {
       fromAddressKind?: AddressKind;
       blockfrostApiKey?: string;
       sponsorAccountIndex?: number | null;
+      sponsorAccountIndexes?: number[];
     };
 
     const effectiveBlockfrostKey =
@@ -338,111 +373,121 @@ export async function POST(req: NextRequest) {
       Buffer.from(baseAddressHex, "hex")
     ).to_bech32();
 
-    const sponsorCandidates: SponsorCandidate[] = [];
-
-    const senderUtxos = await bfMaybe(
-      `/addresses/${senderBech32}/utxos`,
-      effectiveBlockfrostKey
-    ) as BlockfrostUtxo[] | null;
-    if (senderUtxos?.length) {
-      sponsorCandidates.push({
-        accountIndex: null,
-        address: senderBech32,
-        signingKeyHexes: [signingKeyHex],
-      });
+    const rankedIndexes = normalizeAccountIndexes(sponsorAccountIndexes);
+    if (typeof sponsorAccountIndex === "number" && Number.isInteger(sponsorAccountIndex) && sponsorAccountIndex >= 0) {
+      if (!rankedIndexes.includes(sponsorAccountIndex)) rankedIndexes.unshift(sponsorAccountIndex);
     }
 
-    if (typeof sponsorAccountIndex === "number") {
-      const sponsorWallets = await deriveWalletsMultiAccount(
-        mnemonic.trim(),
-        1,
-        sponsorAccountIndex + 1
-      );
-      const sponsorWallet = sponsorWallets.find(
-        (wallet) => wallet.accountIndex === sponsorAccountIndex && wallet.index === 0
-      );
-      if (!sponsorWallet) {
-        return NextResponse.json({ error: "Invalid sponsor" }, { status: 400 });
-      }
-
-      const { signingKeyHex: sponsorSigningKeyHex } = await deriveSigningKey(
-        mnemonic.trim(),
-        sponsorAccountIndex,
-        0
-      );
-      sponsorCandidates.push({
-        accountIndex: sponsorAccountIndex,
-        address: sponsorWallet.baseAddress,
-        signingKeyHexes: [sponsorSigningKeyHex, signingKeyHex],
-      });
-    } else {
-      sponsorCandidates.push(...await deriveAutoSponsorCandidates(
-        mnemonic.trim(),
-        signingKeyHex,
-        effectiveBlockfrostKey
-      ));
-    }
-
-    const dedupedSponsorCandidates = sponsorCandidates.filter(
-      (candidate, index, arr) =>
-        arr.findIndex((other) => other.address === candidate.address) === index
-    );
-
-    let lastBuildError = "";
-    let noRedeemableInfo: NoRedeemableThawsInfo | null = null;
+    const attemptState: {
+      lastBuildError: string;
+      noRedeemableInfo: NoRedeemableThawsInfo | null;
+    } = {
+      lastBuildError: "",
+      noRedeemableInfo: null,
+    };
 
     for (let submitAttempt = 0; submitAttempt < 3; submitAttempt++) {
-      let build: MidnightBuildResponse | null = null;
-      let signedTxHex = "";
+      const utxoCache: UtxoCache = new Map();
+      const triedAddresses = new Set<string>();
+      const built: { tx: MidnightBuildResponse | null; signedTxHex: string } = {
+        tx: null,
+        signedTxHex: "",
+      };
 
-      for (const candidate of dedupedSponsorCandidates) {
-        const fundingUtxosRaw = await bfMaybe(
-          `/addresses/${candidate.address}/utxos`,
-          effectiveBlockfrostKey
-        ) as BlockfrostUtxo[] | null;
+      const tryCandidate = async (candidate: SponsorCandidate) => {
+        if (triedAddresses.has(candidate.address)) return false;
+        triedAddresses.add(candidate.address);
 
-        if (!fundingUtxosRaw?.length) continue;
+        const fundingUtxosRaw = candidate.utxos?.length
+          ? candidate.utxos
+          : await loadUtxos(candidate.address, effectiveBlockfrostKey, utxoCache);
+        if (!fundingUtxosRaw?.length) return false;
 
         const { selected, lovelace } = selectFundingUtxos(fundingUtxosRaw);
         if (lovelace < MIN_FUNDING_LOVELACE) {
-          // Too poor to cover min-ADA + fee; a sponsor further down the list can.
-          lastBuildError =
+          attemptState.lastBuildError =
             `${candidate.address} has only ${(Number(lovelace) / 1_000_000).toFixed(2)} ADA available ` +
             `in its ${MAX_FUNDING_UTXOS} largest UTxOs, which cannot cover the claim`;
-          continue;
+          return false;
         }
 
         try {
           const fundingUtxos = await toCborFundingUtxos(candidate.address, selected);
-          build = await buildClaimTx(senderBech32, candidate.address, fundingUtxos);
-          signedTxHex = await signBuiltTransaction(
-            build.transaction,
-            build.require_thawing_extra_signature ? candidate.signingKeyHexes : [candidate.signingKeyHexes[0]]
+          const nextBuild = await buildClaimTx(senderBech32, candidate.address, fundingUtxos);
+          built.tx = nextBuild;
+          built.signedTxHex = await signBuiltTransaction(
+            nextBuild.transaction,
+            nextBuild.require_thawing_extra_signature ? candidate.signingKeyHexes : [candidate.signingKeyHexes[0]]
           );
-          break;
+          return true;
         } catch (err) {
-          lastBuildError = String(err);
-          noRedeemableInfo = parseNoRedeemableThaws(lastBuildError) ?? noRedeemableInfo;
+          attemptState.lastBuildError = String(err);
+          attemptState.noRedeemableInfo =
+            parseNoRedeemableThaws(attemptState.lastBuildError) ?? attemptState.noRedeemableInfo;
+          return false;
+        }
+      };
+
+      if (!rankedIndexes.length) {
+        const senderUtxos = await loadUtxos(senderBech32, effectiveBlockfrostKey, utxoCache);
+        if (senderUtxos?.length) {
+          await tryCandidate({
+            accountIndex: null,
+            address: senderBech32,
+            signingKeyHexes: [signingKeyHex],
+            utxos: senderUtxos,
+          });
         }
       }
 
-      if (!build || !signedTxHex) {
-        if (noRedeemableInfo) {
+      if (!built.tx || !built.signedTxHex) {
+        if (rankedIndexes.length) {
+          for (const accountIndex of rankedIndexes) {
+            const [wallet] = await deriveWallets(mnemonic.trim(), 1, accountIndex);
+            const utxos = await loadUtxos(wallet.baseAddress, effectiveBlockfrostKey, utxoCache);
+            if (!utxos?.length) continue;
+            const { signingKeyHex: sponsorSigningKeyHex } = await deriveSigningKey(
+              mnemonic.trim(),
+              accountIndex,
+              0
+            );
+            if (await tryCandidate({
+              accountIndex,
+              address: wallet.baseAddress,
+              signingKeyHexes: [sponsorSigningKeyHex, signingKeyHex],
+              utxos,
+            })) break;
+          }
+        } else {
+          const scanned = await deriveAutoSponsorCandidates(
+            mnemonic.trim(),
+            signingKeyHex,
+            effectiveBlockfrostKey,
+            utxoCache
+          );
+          for (const candidate of scanned) {
+            if (await tryCandidate(candidate)) break;
+          }
+        }
+      }
+
+      if (!built.tx || !built.signedTxHex) {
+        if (attemptState.noRedeemableInfo) {
           return NextResponse.json({
             code: "NO_REDEEMABLE_THAWS",
-            error: noRedeemableInfo.nextThawAt
-              ? `There is no claimable thaw yet. Next thaw: ${noRedeemableInfo.nextThawAt}`
+            error: attemptState.noRedeemableInfo.nextThawAt
+              ? `There is no claimable thaw yet. Next thaw: ${attemptState.noRedeemableInfo.nextThawAt}`
               : "There is no claimable thaw yet for this wallet.",
-            nextThawAt: noRedeemableInfo.nextThawAt,
-            nowAt: noRedeemableInfo.nowAt,
+            nextThawAt: attemptState.noRedeemableInfo.nextThawAt,
+            nowAt: attemptState.noRedeemableInfo.nowAt,
           }, { status: 409 });
         }
         return NextResponse.json({
-          error: lastBuildError || "No sponsor with enough ADA was found to submit the claim",
+          error: attemptState.lastBuildError || "No sponsor with enough ADA was found to submit the claim",
         }, { status: 400 });
       }
 
-      await waitForValidityWindow(signedTxHex, effectiveBlockfrostKey);
+      await waitForValidityWindow(built.signedTxHex, effectiveBlockfrostKey);
 
       const submitRes = await fetch(`${BF}/tx/submit`, {
         method: "POST",
@@ -450,7 +495,7 @@ export async function POST(req: NextRequest) {
           project_id: effectiveBlockfrostKey,
           "Content-Type": "application/cbor",
         },
-        body: Buffer.from(signedTxHex, "hex"),
+        body: Buffer.from(built.signedTxHex, "hex"),
         signal: AbortSignal.timeout(30_000),
       });
       const submitText = await submitRes.text();
@@ -458,7 +503,7 @@ export async function POST(req: NextRequest) {
         const txHash = submitText.replace(/"/g, "");
         return NextResponse.json({
           txHash,
-          redeemedAmount: build.redeemed_amount,
+          redeemedAmount: built.tx.redeemed_amount,
           explorerUrl: `https://cardanoscan.io/transaction/${txHash}`,
         });
       }

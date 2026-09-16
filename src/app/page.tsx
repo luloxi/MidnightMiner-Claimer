@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { playNotify, unlockNotifyAudio } from "@/lib/notify";
 
 interface ClaimTarget {
   chain: 0 | 1;
@@ -302,9 +303,7 @@ export default function Home() {
   const [blockfrostKey, setBlockfrostKey] = useState("");
   const [minClaimNight, setMinClaimNight] = useState("5");
   const [consolidationAddress, setConsolidationAddress] = useState("");
-  const [sponsorOptions, setSponsorOptions] = useState<SponsorOption[]>([]);
   const [selectedSponsorAccountIndex, setSelectedSponsorAccountIndex] = useState<string>("auto");
-  const [sponsorsLoading, setSponsorsLoading] = useState(false);
   const [transfer, setTransfer]         = useState<TransferState | null>(null);
   const [rowActions, setRowActions]     = useState<Record<string, RowActionState>>({});
   const [playState, setPlayState]       = useState<PlayState>({
@@ -336,35 +335,32 @@ export default function Home() {
   }, [playState]);
 
   useEffect(() => {
-    void fetchSponsors();
+    const unlock = () => unlockNotifyAudio();
+    window.addEventListener("pointerdown", unlock, { once: true });
+    window.addEventListener("keydown", unlock, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
   }, []);
 
-  useEffect(() => {
-    if (wallets.length > 0) {
-      void fetchBalances(wallets);
-    }
-  }, [selectedSponsorAccountIndex]);
-
-  async function fetchSponsors() {
-    setSponsorsLoading(true);
-    try {
-      const res = await fetch("/api/sponsors", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mnemonic,
-          blockfrostApiKey: blockfrostKey,
-        }),
+  const sponsorOptions = useMemo<SponsorOption[]>(() => {
+    const seen = new Set<number>();
+    return wallets
+      .filter((wallet) => Number(wallet.lovelace ?? 0) > 0)
+      .sort((a, b) => Number(b.lovelace ?? 0) - Number(a.lovelace ?? 0))
+      .flatMap((wallet) => {
+        if (seen.has(wallet.accountIndex)) return [];
+        seen.add(wallet.accountIndex);
+        return [{
+          accountIndex: wallet.accountIndex,
+          index: wallet.index,
+          baseAddress: wallet.baseAddress,
+          lovelace: wallet.lovelace ?? "0",
+          adaDisplay: wallet.adaDisplay ?? "0.00 ADA",
+        }];
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      setSponsorOptions(data.sponsors ?? []);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSponsorsLoading(false);
-    }
-  }
+  }, [wallets]);
 
   // ── Fetch balances ─────────────────────────────────────────────────────────
   async function fetchBalances(walletList: Wallet[]) {
@@ -415,6 +411,7 @@ export default function Home() {
         })
       );
       setWallets(nextWallets);
+      walletsRef.current = nextWallets;
       setBalancesLoaded(true);
       return nextWallets;
     } catch (e) {
@@ -425,13 +422,29 @@ export default function Home() {
     }
   }
 
-  async function refreshBalancesWithRetry(walletList: Wallet[], attempts = 4) {
-    let latestWallets = walletList;
-    for (let i = 0; i < attempts; i++) {
-      latestWallets = await fetchBalances(latestWallets);
-      if (i < attempts - 1) await sleep(2_000);
+  function patchWallets(updater: (wallet: Wallet) => Wallet) {
+    const next = walletsRef.current.map(updater);
+    walletsRef.current = next;
+    setWallets(next);
+  }
+
+  function getSponsorAccountIndexes() {
+    if (selectedSponsorAccountIndex !== "auto") {
+      const n = Number(selectedSponsorAccountIndex);
+      return Number.isInteger(n) && n >= 0 ? [n] : [];
     }
-    return latestWallets;
+    const seen = new Set<number>();
+    const funded = walletsRef.current.filter((wallet) => Number(wallet.lovelace ?? 0) >= 3_000_000);
+    const pool = funded.length
+      ? funded
+      : walletsRef.current.filter((wallet) => Number(wallet.lovelace ?? 0) > 0);
+    return [...pool]
+      .sort((a, b) => Number(b.lovelace ?? 0) - Number(a.lovelace ?? 0))
+      .flatMap((wallet) => {
+        if (seen.has(wallet.accountIndex)) return [];
+        seen.add(wallet.accountIndex);
+        return [wallet.accountIndex];
+      });
   }
 
   // ── Derive + auto-fetch balances ───────────────────────────────────────────
@@ -439,8 +452,8 @@ export default function Home() {
     setError("");
     setLoading(true);
     setWallets([]);
+    walletsRef.current = [];
     confirmedClaimsRef.current = new Set();
-    setSponsorOptions([]);
     setSelectedSponsorAccountIndex("auto");
     setBalancesLoaded(false);
     try {
@@ -452,8 +465,8 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setWallets(data.wallets);
+      walletsRef.current = data.wallets;
       setLoading(false);
-      await fetchSponsors();
       await fetchBalances(data.wallets);
     } catch (e) {
       setError(String(e));
@@ -520,41 +533,9 @@ export default function Home() {
     );
   }
 
-  function playCompletionSound() {
-    if (typeof window === "undefined") return;
-    const AudioCtx = window.AudioContext || (window as typeof window & {
-      webkitAudioContext?: typeof AudioContext;
-    }).webkitAudioContext;
-    if (!AudioCtx) return;
-
-    const ctx = new AudioCtx();
-    const notes = [
-      { freq: 880, start: 0, duration: 0.08 },
-      { freq: 1174.66, start: 0.1, duration: 0.08 },
-      { freq: 1567.98, start: 0.22, duration: 0.16 },
-    ];
-
-    for (const note of notes) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = note.freq;
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime + note.start);
-      gain.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + note.start + 0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + note.start + note.duration);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(ctx.currentTime + note.start);
-      osc.stop(ctx.currentTime + note.start + note.duration);
-    }
-
-    window.setTimeout(() => {
-      void ctx.close().catch(() => undefined);
-    }, 700);
-  }
-
   async function waitForTransactionConfirmation(txHash: string) {
-    for (let attempt = 0; attempt < 90; attempt++) {
+    await sleep(8_000);
+    for (let attempt = 0; attempt < 40; attempt++) {
       const res = await fetch("/api/tx-status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -568,14 +549,15 @@ export default function Home() {
         throw new Error(data.error || "Could not verify the transaction");
       }
       if (data.confirmed) return data as { confirmed: boolean; confirmations: number; explorerUrl: string };
-      await sleep(4_000);
+      await sleep(2_500);
     }
 
     throw new Error("The transaction did not confirm in time");
   }
 
-  async function claimNightAndWait(w: Wallet) {
+  async function claimNightAndWait(w: Wallet, opts?: { notify?: boolean }) {
     setRowAction(w.baseAddress, { loading: true, error: "", result: null });
+    const notify = opts?.notify ?? !playStateRef.current.running;
     try {
       // A thaw is registered per payment address, so a wallet can have redeemable amounts on
       // several of its addresses (external/change, base/enterprise). Claim each of them.
@@ -585,6 +567,7 @@ export default function Home() {
 
       let lastData: { txHash: string; explorerUrl: string; redeemedAmount?: number } | null = null;
 
+      const rankedSponsors = getSponsorAccountIndexes();
       for (const target of targets) {
         const res = await fetch("/api/claim", {
           method: "POST",
@@ -598,8 +581,9 @@ export default function Home() {
             blockfrostApiKey: blockfrostKey,
             sponsorAccountIndex:
               selectedSponsorAccountIndex === "auto"
-                ? null
+                ? (rankedSponsors[0] ?? null)
                 : Number(selectedSponsorAccountIndex),
+            sponsorAccountIndexes: rankedSponsors,
           }),
         });
         const data = await res.json();
@@ -619,13 +603,26 @@ export default function Home() {
       confirmedClaimsRef.current = new Set(confirmedClaimsRef.current).add(w.baseAddress);
       setRowAction(w.baseAddress, { loading: false, result: lastData, error: "" });
 
-      void fetchSponsors();
-      void refreshBalancesWithRetry(walletsRef.current);
+      const redeemed = BigInt(lastData.redeemedAmount ?? 0);
+      patchWallets((wallet) => {
+        if (wallet.baseAddress !== w.baseAddress) return wallet;
+        const night = BigInt(wallet.nightAmount ?? "0") + redeemed;
+        return {
+          ...wallet,
+          claimableNight: "0",
+          claimableDisplay: "0 NIGHT",
+          claimTargets: [],
+          nightAmount: night.toString(),
+          nightDisplay: (Number(night) / 1_000_000).toFixed(4) + " NIGHT",
+        };
+      });
 
+      if (notify) playNotify("tick");
       return { result: lastData };
     } catch (e) {
       const message = String(e);
       setRowAction(w.baseAddress, { loading: false, error: message });
+      if (notify) playNotify("error");
       throw new Error(message);
     }
   }
@@ -666,31 +663,32 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
-      setWallets((prev) =>
-        prev.map((wallet) => {
-          if (wallet.baseAddress === w.baseAddress) {
-            return {
-              ...wallet,
-              lovelace: reserveLovelace.toString(),
-              adaDisplay: (Number(reserveLovelace) / 1_000_000).toFixed(2) + " ADA",
-            };
-          }
-          if (wallet.baseAddress === nextWallet.baseAddress) {
-            const updated = BigInt(wallet.lovelace ?? "0") + optimisticSend;
-            return {
-              ...wallet,
-              lovelace: updated.toString(),
-              adaDisplay: (Number(updated) / 1_000_000).toFixed(2) + " ADA",
-            };
-          }
-          return wallet;
-        })
-      );
+      await waitForTransactionConfirmation(data.txHash);
+
+      patchWallets((wallet) => {
+        if (wallet.baseAddress === w.baseAddress) {
+          return {
+            ...wallet,
+            lovelace: reserveLovelace.toString(),
+            adaDisplay: (Number(reserveLovelace) / 1_000_000).toFixed(2) + " ADA",
+          };
+        }
+        if (wallet.baseAddress === nextWallet.baseAddress) {
+          const updated = BigInt(wallet.lovelace ?? "0") + optimisticSend;
+          return {
+            ...wallet,
+            lovelace: updated.toString(),
+            adaDisplay: (Number(updated) / 1_000_000).toFixed(2) + " ADA",
+          };
+        }
+        return wallet;
+      });
 
       setRowAction(w.baseAddress, { loading: false, result: data });
-      void refreshBalancesWithRetry(wallets);
+      playNotify("tick");
     } catch (e) {
       setRowAction(w.baseAddress, { loading: false, error: String(e) });
+      playNotify("error");
     }
   }
 
@@ -759,7 +757,7 @@ export default function Home() {
             lastMessage: `Play mode complete. ${claimedCount} claim(s) confirmed.`,
             stopRequested: false,
           }));
-          playCompletionSound();
+          playNotify("done");
           return;
         }
 
@@ -769,7 +767,7 @@ export default function Home() {
           lastMessage: `Claiming ${formatWalletLabel(nextWallet)}...`,
         }));
 
-        await claimNightAndWait(nextWallet);
+        await claimNightAndWait(nextWallet, { notify: false });
         claimedCount += 1;
 
         setPlayState((prev) => ({
@@ -788,6 +786,7 @@ export default function Home() {
         lastMessage: `Play mode stopped due to an error: ${String(e)}`,
         stopRequested: false,
       }));
+      playNotify("error");
     }
   }
 
@@ -828,10 +827,12 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
+      await waitForTransactionConfirmation(data.txHash);
       setTransfer(t => t ? { ...t, submitting: false, result: data } : t);
-      void refreshBalancesWithRetry(wallets);
+      playNotify("tick");
     } catch (e) {
       setTransfer(t => t ? { ...t, submitting: false, error: String(e) } : t);
+      playNotify("error");
     }
   }
 
@@ -871,6 +872,7 @@ export default function Home() {
     });
 
     let submittedCount = 0;
+    let hadError = false;
 
     for (const wallet of walletsWithNight) {
       setConsolidationState((prev) => ({
@@ -941,7 +943,28 @@ export default function Home() {
             if (!topupRes.ok) throw new Error(topupData.error);
 
             await waitForTransactionConfirmation(topupData.txHash);
-            await fetchBalances(walletsRef.current);
+            const topupLovelace = BigInt(2_000_000);
+            const feeEstimate = BigInt(250_000);
+            patchWallets((candidate) => {
+              if (candidate.baseAddress === sponsorWallet.baseAddress) {
+                const next = BigInt(candidate.lovelace ?? "0") - topupLovelace - feeEstimate;
+                const lovelace = next > 0n ? next : BigInt(0);
+                return {
+                  ...candidate,
+                  lovelace: lovelace.toString(),
+                  adaDisplay: (Number(lovelace) / 1_000_000).toFixed(2) + " ADA",
+                };
+              }
+              if (candidate.baseAddress === wallet.baseAddress) {
+                const lovelace = BigInt(candidate.lovelace ?? "0") + topupLovelace;
+                return {
+                  ...candidate,
+                  lovelace: lovelace.toString(),
+                  adaDisplay: (Number(lovelace) / 1_000_000).toFixed(2) + " ADA",
+                };
+              }
+              return candidate;
+            });
             continue;
           }
 
@@ -959,6 +982,11 @@ export default function Home() {
         await waitForTransactionConfirmation(transferResult.txHash);
 
         submittedCount += 1;
+        patchWallets((candidate) => (
+          candidate.baseAddress === wallet.baseAddress
+            ? { ...candidate, nightAmount: "0", nightDisplay: "0 NIGHT" }
+            : candidate
+        ));
         setRowAction(wallet.baseAddress, { loading: false, result: transferResult, error: "" });
         setConsolidationState((prev) => ({
           ...prev,
@@ -966,6 +994,7 @@ export default function Home() {
           lastMessage: `${formatWalletLabel(wallet)} sent. Continuing with the next wallet...`,
         }));
       } catch (e) {
+        hadError = true;
         setRowAction(wallet.baseAddress, { loading: false, error: String(e), result: null });
         setConsolidationState((prev) => ({
           ...prev,
@@ -979,7 +1008,7 @@ export default function Home() {
       running: false,
       lastMessage: `Consolidation submitted. ${submittedCount}/${prev.totalCount} transactions submitted.`,
     }));
-    void refreshBalancesWithRetry(walletsRef.current);
+    playNotify(hadError || submittedCount === 0 ? "error" : "done");
   }
 
   const totalAda   = wallets.reduce((s, w) => s + Number(w.lovelace ?? 0), 0) / 1_000_000;
@@ -1022,6 +1051,24 @@ export default function Home() {
           <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-right">
             <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Modo</div>
             <div className="mt-1 text-sm font-medium text-slate-200">Dark minimal operator view</div>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => { unlockNotifyAudio(); playNotify("done"); }}
+                className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 hover:text-white hover:bg-white/10"
+                title="Preview the completion chime"
+              >
+                ♪ Done
+              </button>
+              <button
+                type="button"
+                onClick={() => { unlockNotifyAudio(); playNotify("error"); }}
+                className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 hover:text-white hover:bg-white/10"
+                title="Preview the error chime"
+              >
+                ♪ Error
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1063,10 +1110,10 @@ export default function Home() {
                   ))}
                 </select>
                 <div className="text-xs text-slate-600">
-                  {sponsorsLoading
-                    ? "Loading sponsors..."
-                    : selectedSponsorOption
-                      ? `${selectedSponsorOption.baseAddress.slice(0, 24)}…${selectedSponsorOption.baseAddress.slice(-8)}`
+                  {selectedSponsorOption
+                    ? `${selectedSponsorOption.baseAddress.slice(0, 24)}…${selectedSponsorOption.baseAddress.slice(-8)}`
+                    : sponsorOptions.length
+                      ? `Auto uses the wallet with most ADA (${sponsorOptions[0].adaDisplay}).`
                       : "Choose the sponsor account manually or use automatic selection."}
                 </div>
               </div>

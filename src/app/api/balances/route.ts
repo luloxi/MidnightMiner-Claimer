@@ -22,6 +22,21 @@ function chunk<T>(arr: T[], n: number): T[][] {
   return out;
 }
 
+async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  if (!items.length) return [];
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
 async function koiosPost<T>(path: string, body: object): Promise<{ ok: boolean; data: T[] }> {
   try {
     const res = await fetch(`${KOIOS_API}${path}`, {
@@ -257,9 +272,10 @@ export async function POST(req: NextRequest) {
   const blockfrostKey =
     blockfrostApiKey?.trim() || process.env.BLOCKFROST_API_KEY?.trim() || "";
 
-  // Process in chunks of 10 — await each to avoid concurrent Object.assign races
-  const batches = chunk(allAddrs, 10);
-  for (const batch of batches) {
+  // Koios accepts up to 50 addresses. Missing rows mean 0, not "ask Blockfrost".
+  const batches = chunk(allAddrs, 50);
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
     const [adaRes, nightRes] = await Promise.all([
       koiosPost<KoiosAddressInfo>("/address_info", { _addresses: batch }),
       koiosPost<KoiosAddressAssetRow>("/address_assets", { _addresses: batch }),
@@ -271,7 +287,6 @@ export async function POST(req: NextRequest) {
     }
     if (nightRes.ok) {
       koiosAlive = true;
-      // Each row is one flat asset entry — filter for NIGHT rows only
       for (const r of nightRes.data) {
         if (r.policy_id === NIGHT_POLICY && r.asset_name === NIGHT_NAME) {
           nightMap[r.address] = (nightMap[r.address] ?? BigInt(0)) + BigInt(r.quantity);
@@ -279,40 +294,34 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Small delay between chunks to respect rate limits
-    if (batches.length > 1) await new Promise(r => setTimeout(r, 200));
+    if (i < batches.length - 1) await new Promise(r => setTimeout(r, 50));
   }
 
-  if (blockfrostKey) {
+  // Only hit Blockfrost when Koios itself is down — never for "address not in result".
+  if (blockfrostKey && !koiosAlive) {
     for (const address of allAddrs) {
-      const needsAdaFallback = !koiosAlive || !(address in adaMap);
-      const needsNightFallback = !koiosAlive || !(address in nightMap);
-      if (!needsAdaFallback && !needsNightFallback) continue;
-
       const utxos = await bf(`/addresses/${address}/utxos`, blockfrostKey) as BlockfrostUtxo[] | null;
       if (!utxos) continue;
 
-      if (needsAdaFallback) {
-        const lovelace = utxos.reduce((sum, utxo) => {
-          const quantity = utxo.amount.find((amount) => amount.unit === "lovelace")?.quantity ?? "0";
-          return sum + BigInt(quantity);
-        }, BigInt(0));
-        adaMap[address] = lovelace.toString();
-      }
+      const lovelace = utxos.reduce((sum, utxo) => {
+        const quantity = utxo.amount.find((amount) => amount.unit === "lovelace")?.quantity ?? "0";
+        return sum + BigInt(quantity);
+      }, BigInt(0));
+      adaMap[address] = lovelace.toString();
 
-      if (needsNightFallback) {
-        const nightAmount = utxos.reduce((sum, utxo) => {
-          const quantity = utxo.amount.find((amount) => amount.unit === `${NIGHT_POLICY}${NIGHT_NAME}`)?.quantity ?? "0";
-          return sum + BigInt(quantity);
-        }, BigInt(0));
-        nightMap[address] = nightAmount;
-      }
+      const nightAmount = utxos.reduce((sum, utxo) => {
+        const quantity = utxo.amount.find((amount) => amount.unit === `${NIGHT_POLICY}${NIGHT_NAME}`)?.quantity ?? "0";
+        return sum + BigInt(quantity);
+      }, BigInt(0));
+      nightMap[address] = nightAmount;
     }
   }
 
   // Thaw lookups are independent of Blockfrost — a missing key must not zero out the claimable column.
-  const thawEntries = await Promise.all(
-    wallets.map(async (w) => [w.baseAddress, await fetchWalletThaws(w)] as const)
+  const thawEntries = await mapLimit(
+    wallets,
+    8,
+    async (w) => [w.baseAddress, await fetchWalletThaws(w)] as const
   );
   const thawMap = Object.fromEntries(thawEntries) as Record<string, WalletThawSummary>;
 

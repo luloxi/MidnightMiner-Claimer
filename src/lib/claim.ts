@@ -251,35 +251,38 @@ export function normalizeAccountIndexes(input: unknown): number[] {
   return out;
 }
 
-export async function waitForValidityWindow(txHex: string, blockfrostApiKey: string) {
+/** Slot before which the transaction is invalid (its `invalidBefore`), or null when unset. */
+export async function txInvalidBefore(txHex: string): Promise<number | null> {
   const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
-  const tx = lib.Transaction.from_bytes(Buffer.from(txHex, "hex"));
-  const txBody = tx.body();
-  const invalidBefore =
+  const txBody = lib.Transaction.from_bytes(Buffer.from(txHex, "hex")).body();
+  const raw =
     txBody.validity_start_interval_bignum?.()?.to_str?.() ??
     txBody.validity_start_interval?.()?.toString?.() ??
     null;
+  const slot = raw === null ? NaN : Number(raw);
+  return Number.isFinite(slot) ? slot : null;
+}
 
-  if (!invalidBefore) return;
-
-  const targetSlot = Number(invalidBefore);
-  if (!Number.isFinite(targetSlot)) return;
-  const requiredSlot = targetSlot + 1;
-
-  const latestBlock = await bf("/blocks/latest", blockfrostApiKey);
-  const currentSlot = Number(latestBlock.slot ?? 0);
-  if (currentSlot >= requiredSlot) return;
-
-  const waitMs = Math.min(Math.max(requiredSlot - currentSlot, 1) * 1_000 + 400, 25_000);
-  await sleep(waitMs);
-
-  const check = await bf("/blocks/latest", blockfrostApiKey);
-  const slotAfterWait = Number(check.slot ?? 0);
-  if (slotAfterWait >= requiredSlot) return;
-
-  if (slotAfterWait < requiredSlot) {
-    await sleep(Math.min(Math.max(requiredSlot - slotAfterWait, 1) * 1_000 + 400, 8_000));
+/**
+ * The thaw builder sets `invalidBefore` a few slots past the current tip. The ledger checks it
+ * against the slot of the latest block, not wall-clock time, so wait until a block at or past that
+ * slot exists before submitting. Polls for up to `maxWaitMs` (blocks arrive every ~20 s).
+ */
+export async function waitForValidityWindow(txHex: string, blockfrostApiKey: string, maxWaitMs = 120_000) {
+  const invalidBefore = await txInvalidBefore(txHex);
+  if (invalidBefore === null) return;
+  const deadline = Date.now() + maxWaitMs;
+  while (true) {
+    const latestBlock = await bf("/blocks/latest", blockfrostApiKey);
+    const tip = Number(latestBlock.slot ?? 0);
+    if (tip >= invalidBefore) return;
+    if (Date.now() > deadline) return;
+    await sleep(Math.min(Math.max((invalidBefore - tip) * 1_000, 3_000), 10_000));
   }
+}
+
+export function isOutsideValidityError(errorText: string) {
+  return errorText.includes("OutsideValidityIntervalUTxO");
 }
 
 async function deriveAutoSponsorCandidates(
@@ -597,6 +600,38 @@ export async function runClaim(
         feeLovelace,
         sponsorAddress: built.sponsorAddress,
       };
+    }
+
+    if (isOutsideValidityError(submitText)) {
+      // Not valid *yet* (invalidHereafter is unset), so wait for the next block and resend it as is.
+      for (let resend = 0; resend < 4; resend++) {
+        await sleep(10_000);
+        await waitForValidityWindow(built.signedTxHex, effectiveBlockfrostKey);
+        const again = await fetch(`${BF}/tx/submit`, {
+          method: "POST",
+          headers: { project_id: effectiveBlockfrostKey, "Content-Type": "application/cbor" },
+          body: Buffer.from(built.signedTxHex, "hex"),
+          signal: AbortSignal.timeout(30_000),
+        });
+        const againText = await again.text();
+        if (again.ok) {
+          const txHash = againText.replace(/"/g, "");
+          return {
+            kind: "submitted",
+            txHash,
+            redeemedAmount: built.tx.redeemed_amount,
+            explorerUrl: `https://cardanoscan.io/transaction/${txHash}`,
+            feeLovelace,
+            sponsorAddress: built.sponsorAddress,
+          };
+        }
+        if (!isOutsideValidityError(againText)) {
+          if (isSpentInputsSubmitError(againText) && submitAttempt < 2) break;
+          return { kind: "submit_failed", error: `Submit failed: ${againText}` };
+        }
+      }
+      if (submitAttempt === 2) return { kind: "submit_failed", error: `Submit failed: ${submitText}` };
+      continue; // rebuild with fresh UTxOs and a fresh validity window
     }
 
     if (!isSpentInputsSubmitError(submitText) || submitAttempt === 2) {

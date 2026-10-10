@@ -54,6 +54,26 @@ async function main() {
   assert.equal(wet.kind, "submitted");
   assert.equal(calls.filter((c) => c.endsWith("/tx/submit")).length, 1);
   console.log("ok - submit:true calls /tx/submit exactly once");
+
+  // OutsideValidityIntervalUTxO on the first submit: the same tx is resent and succeeds.
+  calls.length = 0;
+  let submits = 0;
+  const inner = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith("/tx/submit")) {
+      calls.push(url);
+      submits++;
+      if (submits === 1) {
+        return new Response('{"message":"OutsideValidityIntervalUTxO (ValidityInterval {invalidBefore = SJust (SlotNo 10)}) (SlotNo 8)"}', { status: 400 });
+      }
+    }
+    return inner(input, init);
+  }) as typeof fetch;
+  const retried = await runClaim(params, { submit: true });
+  assert.equal(retried.kind, "submitted");
+  assert.equal(submits, 2);
+  console.log("ok - OutsideValidityIntervalUTxO is retried by resending the same tx");
 }
 
 main().catch((err) => {

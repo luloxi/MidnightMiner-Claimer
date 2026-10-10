@@ -5,9 +5,9 @@ import https from "node:https";
 
 const isSubmit = (url) => {
   try {
-    return /\/submit\b/i.test(new URL(url).pathname);
+    return /submit/i.test(new URL(url).pathname);
   } catch {
-    return /\/submit\b/i.test(String(url));
+    return /submit/i.test(String(url));
   }
 };
 const block = () => {

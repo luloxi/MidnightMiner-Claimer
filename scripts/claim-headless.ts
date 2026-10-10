@@ -14,6 +14,7 @@
  *
  * Exit codes: 0 = finished cleanly (including "nothing to claim"), 1 = something failed, 2 = bad usage.
  */
+import { mkdirSync, writeFileSync } from "node:fs";
 import { validateMnemonic } from "bip39";
 import {
   addressVariants,
@@ -32,6 +33,9 @@ import { fetchWalletThaws, MidnightThaw } from "../src/lib/thaws";
 const SEED_VARS = ["MIDNIGHT_SEED_1", "MIDNIGHT_SEED_2"] as const;
 const NIGHT_UNIT = `${NIGHT_POLICY}${NIGHT_NAME}`;
 const CONFIRM_TIMEOUT_MS = 5 * 60_000;
+const OUT_DIR = process.env.CLAIM_OUT_DIR ?? "/workspace/midnight";
+/** Largest paymaster outflow seen for one claim (~3.27 ADA) plus margin. */
+const WORST_CLAIM_OUTFLOW = BigInt(3_600_000);
 const MINSWAP_AGG = "https://agg-api.minswap.org/aggregator/estimate";
 
 // ── Secrets (read once, then removed from process.env) ────────────────────────
@@ -73,11 +77,16 @@ function usage(code = 2): never {
   console.log(`Usage: npm run claim:headless -- [--report] [--live] [--accounts N] [--addresses N] [--paymaster SEED:ACCOUNT]
 
   --report             dry-run report (this is the default; the flag is accepted for clarity)
-  --accounts N         accounts scanned per seed (env CLAIM_ACCOUNTS, default 5)
+  --accounts N         accounts scanned per seed (env CLAIM_ACCOUNTS, default 30)
+  --min-claim X        only claim tranches above X NIGHT (env CLAIM_MIN_NIGHT, default 5); smaller ones
+                       are reported as skipped and roll into the next thaw
+  --test-one           exactly one claim: the smallest tranche above the minimum, paid by the
+                       richest address of the OTHER seed
   --addresses N        address indexes per account (env CLAIM_ADDRESSES_PER_ACCOUNT, default 1)
   --paymaster S:A      force the fee payer to seed S, account A (external base address, index 0).
                        Default: the scanned address holding the most ADA.
-  --live               submit the claim transactions. Top-ups and swaps are never submitted.`);
+  --live               submit claims, and ADA top-ups between own addresses when a claim needs one.
+                       Swaps are never built or submitted.`);
   process.exit(code);
 }
 
@@ -92,14 +101,21 @@ function parseIntArg(value: string | undefined, label: string, max: number, min 
 
 const argv = process.argv.slice(2);
 let live = false;
-let accounts = parseIntArg(process.env.CLAIM_ACCOUNTS ?? "5", "CLAIM_ACCOUNTS", 200);
+let accounts = parseIntArg(process.env.CLAIM_ACCOUNTS ?? "30", "CLAIM_ACCOUNTS", 200);
 let addressesPerAccount = parseIntArg(process.env.CLAIM_ADDRESSES_PER_ACCOUNT ?? "1", "CLAIM_ADDRESSES_PER_ACCOUNT", 50);
+let testOne = false;
+let minClaimNight = Number(process.env.CLAIM_MIN_NIGHT ?? "5");
 let forcedPaymaster: { seed: number; account: number } | null = null;
 for (let i = 0; i < argv.length; i++) {
   const [arg, inline] = argv[i].split("=", 2);
   const next = () => inline ?? argv[++i];
   if (arg === "--live") live = true;
   else if (arg === "--report" || arg === "--dry-run") { /* default mode */ }
+  else if (arg === "--test-one") testOne = true;
+  else if (arg === "--min-claim") {
+    minClaimNight = Number(next());
+    if (!Number.isFinite(minClaimNight) || minClaimNight < 0) { console.error("--min-claim must be a number ≥ 0"); process.exit(2); }
+  }
   else if (arg === "--accounts") accounts = parseIntArg(next(), "--accounts", 200);
   else if (arg === "--addresses") addressesPerAccount = parseIntArg(next(), "--addresses", 50);
   else if (arg === "--paymaster") {
@@ -219,6 +235,63 @@ interface WalletRow {
   nextThawAt: string | null;
   lookupFailed: boolean;
   targets: { chain: AddressChain; kind: AddressKind; address: string; redeemable: string }[];
+  thaws: { address: string; kind: AddressKind; chain: AddressChain; amount: number; status: string; date: string | null; txId: string | null }[];
+}
+
+interface ClaimRecord {
+  seed: number; account: number; index: number; kind: AddressKind; chain: AddressChain;
+  shortAddress: string; address: string; night: number;
+  status: "dry-run" | "confirmed" | "unconfirmed" | "failed" | "skipped-below-min" | "no-redeemable";
+  paymaster: string; txHash?: string; cardanoscan?: string; feeAda?: number; paymasterNetAda?: number;
+  timestamp: string; attempt?: number; error?: string;
+}
+
+interface TopupRecord {
+  from: string; to: string; ada: number; status: "dry-run" | "confirmed" | "unconfirmed" | "failed";
+  txHash?: string; feeAda?: number; timestamp: string; error?: string;
+}
+
+function baseRecord(
+  job: { row: WalletRow; target: WalletRow["targets"][number] },
+  pm: { seedNo: number; accountIndex: number; address: string },
+  status: ClaimRecord["status"],
+  _stamp: string
+): ClaimRecord {
+  return {
+    seed: job.row.seedNo, account: job.row.accountIndex, index: job.row.index,
+    kind: job.target.kind, chain: job.target.chain,
+    shortAddress: short(job.target.address), address: job.target.address,
+    night: Number(job.target.redeemable) / 1e6, status,
+    paymaster: `seed ${pm.seedNo} acct ${pm.accountIndex} ${short(pm.address)}`,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/** After a live test claim: show who funded the tx and where the NIGHT went. */
+async function verifyTx(txHash: string, claimer: string, payer: string) {
+  const tx = await bf(`/txs/${txHash}/utxos`, blockfrostKey) as {
+    inputs: { address: string; amount: { unit: string; quantity: string }[] }[];
+    outputs: { address: string; amount: { unit: string; quantity: string }[] }[];
+  };
+  const net = new Map<string, { lovelace: bigint; night: bigint }>();
+  const add = (addr: string, amt: { unit: string; quantity: string }[], sign: bigint) => {
+    const cur = net.get(addr) ?? { lovelace: BigInt(0), night: BigInt(0) };
+    for (const a of amt) {
+      if (a.unit === "lovelace") cur.lovelace += sign * BigInt(a.quantity);
+      if (a.unit === NIGHT_UNIT) cur.night += sign * BigInt(a.quantity);
+    }
+    net.set(addr, cur);
+  };
+  for (const i of tx.inputs) add(i.address, i.amount, BigInt(-1));
+  for (const o of tx.outputs) add(o.address, o.amount, BigInt(1));
+  console.log(`
+## TEST-ONE verification (on-chain, ${txHash.slice(0, 12)}…)`);
+  for (const [addr, v] of net) {
+    const who = addr === claimer ? "claiming wallet" : addr === payer ? "paymaster" : "script/other";
+    console.log(`  ${who.padEnd(15)} ${short(addr)} ADA ${adaSigned(v.lovelace)} · NIGHT ${v.night >= BigInt(0) ? "+" : ""}${nightN(v.night)}`);
+  }
+  const c = net.get(claimer); const p = net.get(payer);
+  console.log(`  NIGHT landed in claiming wallet: ${c && c.night > BigInt(0) ? "YES" : "NO"} · paymaster paid ADA: ${p && p.lovelace < BigInt(0) ? "YES" : p ? "net positive (refund > fee)" : "NOT an input"}`);
 }
 
 function top3(utxos: BlockfrostUtxo[]) {
@@ -246,7 +319,12 @@ async function main(): Promise<number> {
 
     const wallets = await deriveWalletsMultiAccount(seed.value, addressesPerAccount, accounts);
     for (const wallet of wallets) {
-      const thaws = await fetchWalletThaws(wallet, (_v, thaw: MidnightThaw) => {
+      const thawList: WalletRow["thaws"] = [];
+      const thaws = await fetchWalletThaws(wallet, (v, thaw: MidnightThaw) => {
+        thawList.push({
+          address: v.address, kind: v.kind, chain: v.chain, amount: (thaw.amount ?? 0) / 1e6,
+          status: thaw.status ?? "unknown", date: thaw.thawing_period_start ?? null, txId: thaw.transaction_id ?? null,
+        });
         const date = (thaw.thawing_period_start ?? "unknown").slice(0, 10);
         const status = thaw.status ?? "unknown";
         const byStatus = calendar.get(date) ?? new Map<string, bigint>();
@@ -259,6 +337,7 @@ async function main(): Promise<number> {
         baseAddress: wallet.baseAddress, lovelace: BigInt(0), night: BigInt(0),
         claimable: thaws?.claimable ?? BigInt(0), nextThawAt: thaws?.nextThawAt ?? null,
         lookupFailed: !thaws || thaws.lookupFailed, targets: thaws?.targets ?? [],
+        thaws: thawList,
       };
       if (row.lookupFailed) problems++;
 
@@ -286,10 +365,10 @@ async function main(): Promise<number> {
 
   // 1. Wallet table
   console.log(`\n## 1. Wallets`);
-  console.log(`seed | acct/idx | address         | ADA        | NIGHT held      | claimable now   | next thaw`);
+  console.log(`seed | acct/idx | address          | ADA        | NIGHT held      | claimable now   | next thaw`);
   for (const r of rows) {
     console.log(
-      `${r.seedNo}    | ${r.accountIndex}/${r.index}      | ${short(r.baseAddress)} | ${adaN(r.lovelace).padStart(10)} | ` +
+      `${String(r.seedNo).padEnd(4)} | ${`${r.accountIndex}/${r.index}`.padEnd(8)} | ${short(r.baseAddress).padEnd(16)} | ${adaN(r.lovelace).padStart(10)} | ` +
       `${nightN(r.night).padStart(15)} | ${(r.lookupFailed && r.claimable === BigInt(0) ? "lookup failed" : nightN(r.claimable)).padStart(15)} | ` +
       `${r.nextThawAt ?? "-"}`
     );
@@ -316,101 +395,199 @@ async function main(): Promise<number> {
     return totalClaimable > BigInt(0) ? 1 : problems > 0 ? 1 : 0;
   }
   console.log(`Paymaster: seed ${paymaster.seedNo} · acct ${paymaster.accountIndex} · ${paymaster.kind}/${paymaster.chain === 0 ? "external" : "change"} · ${short(paymaster.address)} · ${adaN(paymaster.lovelace)} ADA, ${adaN(paymaster.top3Lovelace)} in its 3 largest UTxOs`);
-  const { signingKeyHex: paymasterKey } = await deriveSigningKey(
-    paymaster.mnemonic, paymaster.accountIndex, paymaster.index, paymaster.chain, paymaster.kind
-  );
 
   // 2. Claims
-  console.log(`\n## 2. Claims (${live ? "submitting" : "built in memory, not submitted"})`);
-  const claimFees: bigint[] = [];
-  const outflows: bigint[] = [];
-  let submitted = 0;
-  for (const r of rows) {
-    for (const t of r.targets) {
-      const label = `seed ${r.seedNo} acct ${r.accountIndex}/${r.index} ${t.kind}/${t.chain === 0 ? "ext" : "chg"} ${short(t.address)} ${nightN(t.redeemable)} NIGHT`;
-      try {
-        const result = await runClaim(
-          {
-            mnemonic: r.mnemonic,
-            fromAccountIndex: r.accountIndex,
-            fromAddressIndex: r.index,
-            fromChain: t.chain,
-            fromAddressKind: t.kind,
-            blockfrostApiKey: blockfrostKey,
-            paymaster: { address: paymaster.address, signingKeyHex: paymasterKey },
-          },
-          { submit: live }
-        );
-        if (result.kind === "built") {
-          claimFees.push(BigInt(result.feeLovelace));
-          outflows.push(BigInt(result.sponsorOutflowLovelace));
-          console.log(`${label}: fee ${ada(result.feeLovelace)} · paymaster net ADA change ${adaSigned(-BigInt(result.sponsorOutflowLovelace))} · NOT submitted`);
-        } else if (result.kind === "submitted") {
-          submitted++;
-          claimFees.push(BigInt(result.feeLovelace));
-          console.log(`${label}: SUBMITTED · fee ${ada(result.feeLovelace)}\n    tx ${result.txHash}\n    ${result.explorerUrl}`);
-          const ok = await waitForConfirmation(result.txHash);
-          console.log(ok ? `    confirmed` : `    not confirmed after 5 min, stopping so UTxOs are not double-spent`);
-          if (!ok) return 1;
-        } else if (result.kind === "no_redeemable") {
-          console.log(`${label}: no redeemable thaw at build time${result.nextThawAt ? `, next ${result.nextThawAt}` : ""}`);
-        } else {
-          problems++;
-          console.log(`${label}: ${result.kind}${"error" in result ? `: ${scrub(result.error)}` : ""}`);
-        }
-      } catch (err) {
-        problems++;
-        console.log(`${label}: error: ${scrub(err)}`);
-      }
-    }
+  const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const records: ClaimRecord[] = [];
+  const topups: TopupRecord[] = [];
+  const minRaw = BigInt(Math.round(minClaimNight * 1_000_000));
+
+  type Job = { row: WalletRow; target: WalletRow["targets"][number] };
+  const allJobs: Job[] = rows.flatMap((row) => row.targets.map((target) => ({ row, target })));
+  const eligible = allJobs.filter((j) => BigInt(j.target.redeemable) > minRaw);
+  for (const j of allJobs.filter((x) => BigInt(x.target.redeemable) <= minRaw)) {
+    records.push(baseRecord(j, paymaster, "skipped-below-min", runStamp));
   }
-  if (!claimFees.length) console.log(`No claim was built (nothing claimable right now).`);
 
-  // 3b. Paymaster budget
-  // Claims run one after another, so the worst case is every costly claim landing before any refund.
-  const positive = sum(outflows.filter((o) => o > BigInt(0)));
-  const need = positive + MIN_FUNDING_LOVELACE;
-  const shortfall = need > paymaster.top3Lovelace ? need - paymaster.top3Lovelace : BigInt(0);
-  console.log(`\nPaymaster budget: ${outflows.length} claim(s) · fees ${ada(sum(claimFees))} · net paymaster ADA change ${adaSigned(-sum(outflows))}`);
-  console.log(`Needed up front: ${ada(positive)} worst-case outflow + ${ada(MIN_FUNDING_LOVELACE)} the thaw endpoint requires in the 3 largest UTxOs = ${ada(need)}`);
-  console.log(`Paymaster has ${ada(paymaster.top3Lovelace)} in its 3 largest UTxOs → ${shortfall > BigInt(0) ? `SHORT by ${ada(shortfall)}` : "covered"}`);
-  console.log(`Note: claims are built one by one against the same UTxOs, so in --live each claim waits for the previous one to confirm.`);
+  let jobs = eligible;
+  let pm = paymaster;
+  if (testOne) {
+    const pick = [...eligible].sort((a, b) => (BigInt(a.target.redeemable) < BigInt(b.target.redeemable) ? -1 : 1))[0];
+    if (!pick) {
+      console.log(`\n--test-one: no tranche above ${minClaimNight} NIGHT is claimable, nothing to test.`);
+      return problems > 0 ? 1 : 0;
+    }
+    const otherSeed = ranked.find((a) => a.seedNo !== pick.row.seedNo && a.lovelace >= BigInt(10_000_000));
+    if (!otherSeed) {
+      console.log(`\n--test-one: no address on the other seed has ≥10 ADA to act as paymaster.`);
+      return 1;
+    }
+    jobs = [pick];
+    pm = otherSeed;
+    console.log(`\n## TEST-ONE plan: claim seed ${pick.row.seedNo} acct ${pick.row.accountIndex} ${short(pick.target.address)} ${nightN(pick.target.redeemable)} NIGHT, paid by seed ${pm.seedNo} acct ${pm.accountIndex} ${short(pm.address)} (${adaN(pm.lovelace)} ADA)`);
+  }
 
-  // 2b. Top-up fee (built in memory only, never submitted)
-  console.log(`\n## 2b. ADA top-up (built in memory, never submitted)`);
-  const pp = await bf("/epochs/latest/parameters", blockfrostKey) as { min_fee_a: number; min_fee_b: number };
-  const latest = await bf("/blocks/latest", blockfrostKey) as { slot: number };
-  const donor = ranked.find((a) => a.address !== paymaster.address && a.lovelace >= BigInt(5_000_000));
-  const topupAmount = shortfall > BigInt(1_000_000) ? shortfall + BigInt(500_000) : BigInt(2_000_000);
-  if (donor) {
+  const { signingKeyHex: pmKey } = await deriveSigningKey(pm.mnemonic, pm.accountIndex, pm.index, pm.chain, pm.kind);
+  let pmTop3 = pm.top3Lovelace;
+  const latestForTopup = await bf("/blocks/latest", blockfrostKey) as { slot: number };
+  const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
+  const pmHex = Buffer.from(lib.Address.from_bech32(pm.address).to_bytes()).toString("hex");
+
+  /** Keep the paymaster above the thaw endpoint's floor plus the worst claim seen so far. */
+  async function ensureFunding(): Promise<boolean> {
+    const required = MIN_FUNDING_LOVELACE + WORST_CLAIM_OUTFLOW;
+    if (pmTop3 >= required) return true;
+    const amount = required - pmTop3 + BigInt(2_000_000);
+    const donor = ranked.find((a) => a.address !== pm.address && a.seedNo > 0 && a.lovelace >= amount + BigInt(2_500_000));
+    const rec: TopupRecord = {
+      from: donor ? `seed ${donor.seedNo} acct ${donor.accountIndex} ${short(donor.address)}` : "none",
+      to: `seed ${pm.seedNo} acct ${pm.accountIndex} ${short(pm.address)}`,
+      ada: Number(amount) / 1e6, status: "failed", timestamp: new Date().toISOString(),
+    };
+    topups.push(rec);
+    if (!donor) { rec.error = "no own address can cover the top-up"; console.log(`  top-up needed (${ada(amount)}) but no donor has enough ADA`); return false; }
     try {
       const { signingKeyHex, baseAddressHex } = await deriveSigningKey(donor.mnemonic, donor.accountIndex, donor.index, donor.chain, donor.kind);
-      const lib = await import("@emurgo/cardano-serialization-lib-nodejs");
+      const donorUtxos = live ? await utxosOf(donor.address) : donor.utxos;
       const txHex = await buildAdaTx({
-        utxos: donor.utxos,
-        senderAddrHex: baseAddressHex,
-        recipientAddrHex: Buffer.from(lib.Address.from_bech32(paymaster.address).to_bytes()).toString("hex"),
-        sendAll: false,
-        amountLovelace: topupAmount,
-        signingKeyHex,
-        currentSlot: latest.slot,
+        utxos: donorUtxos, senderAddrHex: baseAddressHex, recipientAddrHex: pmHex,
+        sendAll: false, amountLovelace: amount, signingKeyHex, currentSlot: latestForTopup.slot,
       });
-      const fee = await txFeeLovelace(txHex);
-      const minFee = BigInt(pp.min_fee_a) * BigInt(txHex.length / 2) + BigInt(pp.min_fee_b);
-      console.log(`Sample top-up ${ada(topupAmount)} from seed ${donor.seedNo} acct ${donor.accountIndex} ${short(donor.address)} → paymaster: fee set ${ada(fee)} (buildAdaTx fixed fee) · protocol minimum for its ${txHex.length / 2} bytes ${ada(minFee)} · NOT submitted`);
+      rec.feeAda = Number(await txFeeLovelace(txHex)) / 1e6;
+      if (!live) {
+        rec.status = "dry-run";
+        console.log(`  TOP-UP (dry-run) ${ada(amount)} ${rec.from} → paymaster · fee ${rec.feeAda} ADA · not submitted`);
+        pmTop3 += amount; donor.lovelace -= amount;
+        return true;
+      }
+      const res = await fetch(`${BF}/tx/submit`, {
+        method: "POST", headers: { project_id: blockfrostKey, "Content-Type": "application/cbor" },
+        body: Buffer.from(txHex, "hex"), signal: AbortSignal.timeout(30_000),
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`Submit failed: ${text.slice(0, 300)}`);
+      rec.txHash = text.replace(/"/g, "");
+      rec.status = (await waitForConfirmation(rec.txHash)) ? "confirmed" : "unconfirmed";
+      console.log(`  TOP-UP ${ada(amount)} ${rec.from} → paymaster · ${rec.status} · https://cardanoscan.io/transaction/${rec.txHash}`);
+      donor.lovelace -= amount;
+      await refreshPaymaster();
+      return rec.status === "confirmed";
     } catch (err) {
-      problems++;
-      console.log(`Top-up build failed: ${scrub(err)}`);
+      rec.error = scrub(err);
+      console.log(`  top-up failed: ${rec.error}`);
+      return false;
     }
-  } else {
-    const minFee = BigInt(pp.min_fee_a) * BigInt(300) + BigInt(pp.min_fee_b);
-    console.log(`No second address with ≥5 ADA to build a sample top-up. Estimate for a ~300-byte ADA transfer: ${ada(minFee)} protocol minimum, 0.25 ADA as buildAdaTx sets it.`);
   }
-  if (shortfall > BigInt(0)) {
-    const donors = ranked.filter((a) => a.address !== paymaster.address && a.lovelace > BigInt(3_000_000));
-    const spare = sum(donors.map((d) => d.lovelace - BigInt(2_000_000)));
-    console.log(`Other addresses could spare about ${ada(spare)} (keeping 2 ADA each) → ${spare >= shortfall ? "top-ups cover the shortfall" : "top-ups do NOT cover it, a NIGHT→ADA swap would be needed"}`);
+
+  async function refreshPaymaster() {
+    try {
+      const utxos = await utxosOf(pm.address);
+      pmTop3 = top3(utxos);
+      console.log(`    paymaster now ${adaN(sum(utxos.map(lovelaceOf)))} ADA (${adaN(pmTop3)} in 3 largest UTxOs)`);
+    } catch (err) {
+      console.log(`    paymaster balance check failed: ${scrub(err)}`);
+    }
   }
+
+  async function doClaim(job: Job, attempt: number): Promise<ClaimRecord> {
+    const rec = baseRecord(job, pm, "failed", runStamp);
+    rec.attempt = attempt;
+    const label = `seed ${rec.seed} acct ${String(rec.account).padStart(2)} ${rec.kind}/${rec.chain} ${rec.shortAddress} ${rec.night.toFixed(6)} NIGHT`;
+    if (!(await ensureFunding())) {
+      rec.error = "paymaster below the funding floor and no top-up possible";
+      console.log(`${label}: ${rec.error}`);
+      return rec;
+    }
+    try {
+      const result = await runClaim(
+        {
+          mnemonic: job.row.mnemonic,
+          fromAccountIndex: job.row.accountIndex,
+          fromAddressIndex: job.row.index,
+          fromChain: job.target.chain,
+          fromAddressKind: job.target.kind,
+          blockfrostApiKey: blockfrostKey,
+          paymaster: { address: pm.address, signingKeyHex: pmKey },
+        },
+        { submit: live }
+      );
+      rec.timestamp = new Date().toISOString();
+      if (result.kind === "built") {
+        rec.status = "dry-run";
+        rec.feeAda = Number(result.feeLovelace) / 1e6;
+        rec.paymasterNetAda = -Number(result.sponsorOutflowLovelace) / 1e6;
+        const outflow = BigInt(result.sponsorOutflowLovelace);
+        if (outflow > BigInt(0)) pmTop3 -= outflow;
+        console.log(`${label}: fee ${ada(result.feeLovelace)} · paymaster net ${adaSigned(-outflow)} · NOT submitted`);
+      } else if (result.kind === "submitted") {
+        rec.txHash = result.txHash;
+        rec.cardanoscan = result.explorerUrl;
+        rec.feeAda = Number(result.feeLovelace) / 1e6;
+        rec.night = result.redeemedAmount / 1e6;
+        console.log(`${label}: SUBMITTED · fee ${ada(result.feeLovelace)} · ${result.explorerUrl}`);
+        const ok = await waitForConfirmation(result.txHash);
+        rec.status = ok ? "confirmed" : "unconfirmed";
+        console.log(ok ? `    confirmed` : `    not confirmed after 5 min, continuing (will show up on the next scan)`);
+        await refreshPaymaster();
+      } else if (result.kind === "no_redeemable") {
+        rec.status = "no-redeemable";
+        rec.error = result.nextThawAt ? `next thaw ${result.nextThawAt}` : "no redeemable thaw at build time";
+        console.log(`${label}: ${rec.error}`);
+      } else {
+        rec.error = scrub("error" in result ? `${result.kind}: ${result.error}` : result.kind);
+        console.log(`${label}: ${rec.error}`);
+      }
+    } catch (err) {
+      rec.error = scrub(err);
+      console.log(`${label}: error: ${rec.error}`);
+    }
+    return rec;
+  }
+
+  console.log(`\n## 2. Claims (${live ? "SUBMITTING" : "built in memory, not submitted"}) · min claim > ${minClaimNight} NIGHT · paymaster seed ${pm.seedNo} acct ${pm.accountIndex} ${short(pm.address)}`);
+  const done: ClaimRecord[] = [];
+  for (const job of jobs) done.push(await doClaim(job, 1));
+  const failed = done.filter((r) => r.status === "failed");
+  if (failed.length && !testOne) {
+    console.log(`\nRetrying ${failed.length} failed claim(s) once…`);
+    await sleep(20_000);
+    if (live) await refreshPaymaster();
+    for (const rec of failed) {
+      const job = jobs.find((j) => j.target.address === rec.address)!;
+      const retry = await doClaim(job, 2);
+      done[done.indexOf(rec)] = retry;
+    }
+  }
+  records.push(...done);
+  for (const r of done) if (r.status === "failed" || r.status === "unconfirmed") problems++;
+
+  const skipped = records.filter((r) => r.status === "skipped-below-min");
+  const claimedOrBuilt = done.filter((r) => ["dry-run", "confirmed", "unconfirmed"].includes(r.status));
+  const fees = claimedOrBuilt.reduce((a, r) => a + (r.feeAda ?? 0), 0);
+  console.log(`\nClaims: ${claimedOrBuilt.length} ${live ? "submitted" : "built"} · ${claimedOrBuilt.reduce((a, r) => a + r.night, 0).toFixed(6)} NIGHT · fees ${fees.toFixed(6)} ADA · ${done.filter((r) => r.status === "failed").length} failed`);
+  console.log(`Skipped (≤ ${minClaimNight} NIGHT): ${skipped.length} tranche(s), ${skipped.reduce((a, r) => a + r.night, 0).toFixed(6)} NIGHT: ${skipped.map((r) => `seed ${r.seed} acct ${r.account} ${r.night.toFixed(3)}`).join(", ") || "none"}`);
+  console.log(`Top-ups: ${topups.length ? topups.map((t) => `${t.ada} ADA ${t.from} (${t.status})`).join(", ") : "none needed"}`);
+
+  if (testOne && live) {
+    const rec = done[0];
+    if (rec?.txHash && rec.status === "confirmed") await verifyTx(rec.txHash, rec.address, pm.address);
+  }
+
+  // Records (no secrets: addresses, amounts, hashes only)
+  mkdirSync(OUT_DIR, { recursive: true });
+  const base = `${OUT_DIR}/claims-${live ? "live" : "dryrun"}${testOne ? "-test-one" : ""}-${runStamp}`;
+  writeFileSync(`${base}.json`, JSON.stringify({ live, testOne, minClaimNight, paymaster: { seed: pm.seedNo, account: pm.accountIndex, address: pm.address }, claims: records, topups }, null, 2));
+  const cols = ["seed", "account", "index", "kind", "chain", "shortAddress", "address", "night", "status", "txHash", "cardanoscan", "feeAda", "paymasterNetAda", "timestamp", "attempt", "error"] as const;
+  writeFileSync(`${base}.csv`, [cols.join(","), ...records.map((r) => cols.map((c) => JSON.stringify(r[c] ?? "")).join(","))].join("\n") + "\n");
+  writeFileSync(`${OUT_DIR}/snapshot-${runStamp}.json`, JSON.stringify(rows.map((r) => ({
+    seed: r.seedNo, account: r.accountIndex, index: r.index, address: r.baseAddress,
+    ada: Number(r.lovelace) / 1e6, nightHeld: Number(r.night) / 1e6, claimable: Number(r.claimable) / 1e6,
+    nextThawAt: r.nextThawAt, thaws: r.thaws,
+  })), null, 2));
+  console.log(`Records: ${base}.json / .csv · snapshot ${OUT_DIR}/snapshot-${runStamp}.json`);
+
+  const shortfall = pmTop3 < MIN_FUNDING_LOVELACE ? MIN_FUNDING_LOVELACE - pmTop3 : BigInt(0);
+  if (testOne) return problems > 0 ? 1 : 0;
 
   // 4. Swap quotes
   console.log(`\n## 4. NIGHT → ADA quotes (Minswap aggregator, best route; quote only, nothing is built or sent)`);
@@ -439,7 +616,7 @@ async function main(): Promise<number> {
 
   printCalendar(calendar);
 
-  console.log(`\nSummary: ${rows.length} wallet(s) · claimable ${nightN(totalClaimable)} NIGHT · ${claimFees.length} claim(s) built · ${live ? `${submitted} submitted` : "0 submitted (dry-run)"} · ${problems} problem(s)`);
+  console.log(`\nSummary: ${rows.length} wallet(s) · claimable ${nightN(totalClaimable)} NIGHT · ${claimedOrBuilt.length} claim(s) ${live ? "submitted" : "built, 0 submitted (dry-run)"} · ${skipped.length} skipped below min · ${problems} problem(s)`);
   return problems > 0 ? 1 : 0;
 }
 

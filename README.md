@@ -88,12 +88,19 @@ It prints, per wallet, ADA, NIGHT held, NIGHT claimable now and the next thaw, t
 each built claim, the paymaster and its budget, a sample ADA top-up fee, NIGHT→ADA swap quotes from
 the Minswap aggregator, and the thaw calendar.
 
-Options: `--accounts N` (default 5, env `CLAIM_ACCOUNTS`), `--addresses N` (indexes per account,
-default 1, env `CLAIM_ADDRESSES_PER_ACCOUNT`), `--paymaster SEED:ACCOUNT` (default: the address with
-the most ADA).
+Options: `--accounts N` (default 30, env `CLAIM_ACCOUNTS`), `--addresses N` (indexes per account,
+default 1, env `CLAIM_ADDRESSES_PER_ACCOUNT`), `--min-claim X` (only tranches above X NIGHT are
+claimed, default 5, env `CLAIM_MIN_NIGHT`; smaller ones are reported as skipped and roll into the
+next thaw), `--paymaster SEED:ACCOUNT` (default: the address with the most ADA), and `--test-one`
+(exactly one claim, the smallest tranche above the minimum, paid by the richest address of the other
+seed).
 
-`--live` submits the claims, one at a time, waiting for each confirmation. Top-ups and swaps are only
-quoted, never submitted, in any mode. Exit code 0 means it finished cleanly (also when nothing was
-claimable), 1 means something failed, 2 means bad usage.
+`--live` submits the claims one at a time and waits for each confirmation. A claim that times out is
+logged and the run continues; failures are retried once at the end. When the paymaster drops below
+the funding floor, an ADA top-up from another own address is built (dry-run) or submitted (`--live`).
+Swaps are never built or submitted. Every run writes a per-claim record (JSON and CSV) and a wallet
+snapshot under `/workspace/midnight/` (env `CLAIM_OUT_DIR`), with addresses, amounts and hashes only.
+Exit code 0 means it finished cleanly (also when nothing was claimable), 1 means something failed,
+2 means bad usage.
 
 `npm test` runs an offline test that proves a dry-run never reaches `/tx/submit`.

@@ -107,6 +107,7 @@ export async function buildTracker(opts: {
           case "redeemable":
             remaining++; nightLeft += amount; claimable += amount;
             if (amount > minClaimNight) { row.status = "Claim available"; hasAvailable = true; }
+            else if (!sorted.some((x) => x.status === "upcoming")) { row.status = "Final sweep (next run claims it)"; hasAvailable = true; }
             else { row.status = "Skipped below min (rolls over)"; hasBelowMin = true; skipped++; }
             break;
           case "upcoming":
@@ -168,13 +169,14 @@ export async function buildTracker(opts: {
     "ADA spent on claim fees all-time": round(claims.reduce((a, c) => a + (c.feeAda ?? 0), 0)),
     "NIGHT left to claim": round(walletRows.reduce((a, w) => a + w.nightLeft, 0)),
     "NIGHT claimable now": round(walletRows.reduce((a, w) => a + w.claimable, 0)),
-    "Claims left to do (tranches)": thawRows.filter((r) => ["Upcoming", "Claim available", "Skipped below min (rolls over)", "Failed (retry)"].includes(r.status)).length,
+    "Claims left to do (tranches)": thawRows.filter((r) => ["Upcoming", "Claim available", "Skipped below min (rolls over)", "Final sweep (next run claims it)", "Failed (retry)"].includes(r.status)).length,
     "Tranches below min waiting": thawRows.filter((r) => r.status.startsWith("Skipped below min")).length,
     "Wallets tracked": walletRows.length,
     "Next thaw dates": upcomingDates.join(", "),
     "Min claim (NIGHT)": minClaimNight,
     "Note: rollover": "A skipped tranche is added to the same address's next tranche (seen in the thaw API: e.g. 93.39 skipped, then 186.77 claimed).",
     "Note: deadline": `Thawing ends 2026-12-04. Claim everything before about ${FINAL_DEADLINE} (end of the 90-day grace period).`,
+    "Note: final sweep": "An address with no upcoming thaw left is claimed in full by the next weekly run, even below the minimum.",
     "Note: claimed late": `"Claimed late" means claimed more than ${LATE_AFTER_DAYS} days after the thaw date.`,
   };
 
@@ -192,7 +194,7 @@ export async function buildTracker(opts: {
   const statusFill: Record<string, string> = {
     "Claim available": "FFFDE68A", "Below min (waiting)": "FFFED7AA", Waiting: "FFDBEAFE", Done: "FFD1FAE5",
     Claimed: "FFD1FAE5", "Claimed late": "FFA7F3D0", "Missed (rolled into next)": "FFFECACA",
-    "Skipped below min (rolls over)": "FFFED7AA", Upcoming: "FFDBEAFE", "Failed (retry)": "FFFCA5A5",
+    "Skipped below min (rolls over)": "FFFED7AA", "Final sweep (next run claims it)": "FFFDE68A", Upcoming: "FFDBEAFE", "Failed (retry)": "FFFCA5A5",
   };
   const paint = (cell: ExcelJS.Cell) => {
     const argb = statusFill[String(cell.value)];

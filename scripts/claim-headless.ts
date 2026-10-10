@@ -30,7 +30,7 @@ import {
 import { BF, bf, MAX_FUNDING_UTXOS, MIN_FUNDING_LOVELACE, runClaim, sleep, txFeeLovelace } from "../src/lib/claim";
 import { fetchWalletThaws, MidnightThaw } from "../src/lib/thaws";
 import {
-  buildSwapTx, deepestNightAdaProtocol, DEFAULT_SWAP_RULES, planSwap, quoteNightToAda as quoteSwap,
+  blockfrostReserveLookup, buildSwapTx, deepestNightAdaProtocol, DEFAULT_SWAP_RULES, pickBestQuote, planSwap, quoteNightToAda as quoteSwap,
   submitSwap, txFeeOf, validateQuote, witnessSetFor,
 } from "../src/lib/swap";
 import { buildTracker } from "./tracker";
@@ -84,7 +84,9 @@ function usage(code = 2): never {
   --report             dry-run report (this is the default; the flag is accepted for clarity)
   --accounts N         accounts scanned per seed (env CLAIM_ACCOUNTS, default 30)
   --min-claim X        only claim tranches above X NIGHT (env CLAIM_MIN_NIGHT, default 5); smaller ones
-                       are reported as skipped and roll into the next thaw
+                       are reported as skipped and roll into the next thaw. Final sweep: an address
+                       with no upcoming thaw left is claimed in full whatever the minimum.
+                       --min-claim 0 claims everything.
   --weekly             weekly protocol: claims, top-ups and (if triggered) a swap, then rebuild the
                        tracker workbook at /workspace/midnight/latest-tracker.xlsx
   --allow-swap         with --live, allow the NIGHT→ADA swap fallback to be submitted
@@ -425,8 +427,15 @@ async function main(): Promise<number> {
 
   type Job = { row: WalletRow; target: WalletRow["targets"][number] };
   const allJobs: Job[] = rows.flatMap((row) => row.targets.map((target) => ({ row, target })));
-  const eligible = allJobs.filter((j) => BigInt(j.target.redeemable) > minRaw);
-  for (const j of allJobs.filter((x) => BigInt(x.target.redeemable) <= minRaw)) {
+  // Final sweep: an address with no upcoming thaw has nothing left to roll into, so claim it all.
+  const finalSweep = (j: Job) => !j.row.thaws.some((t) => t.address === j.target.address && t.status === "upcoming");
+  const isEligible = (j: Job) => BigInt(j.target.redeemable) > minRaw || finalSweep(j);
+  const eligible = allJobs.filter(isEligible);
+  const sweeps = eligible.filter((j) => BigInt(j.target.redeemable) <= minRaw);
+  if (sweeps.length) {
+    console.log(`\nFinal sweep (no upcoming thaw left, claimed regardless of --min-claim): ${sweeps.map((j) => `seed ${j.row.seedNo} acct ${j.row.accountIndex} ${nightN(j.target.redeemable)}`).join(", ")}`);
+  }
+  for (const j of allJobs.filter((x) => !isEligible(x))) {
     records.push(baseRecord(j, paymaster, "skipped-below-min", runStamp));
   }
 
@@ -571,7 +580,7 @@ async function main(): Promise<number> {
     const capacity = sum(ranked.filter((a) => a.address !== pm.address && a.lovelace > BigInt(5_000_000)).map((a) => a.lovelace - BigInt(2_500_000)));
     const seller = [...addrs].sort((a, b) => (a.night > b.night ? -1 : 1))[0];
     const venue = await deepestNightAdaProtocol();
-    const probe = await quoteSwap(BigInt(100_000_000), 1, venue.protocol);
+    const probe = await quoteSwap(BigInt(100_000_000), 1);
     const rules = { ...DEFAULT_SWAP_RULES, capNightRaw: BigInt(Math.round(swapCapNight * 1e6)) };
     const plan = planSwap({
       paymasterTop3: pmTop3, pendingClaimCost: pending, topupCapacity: capacity,
@@ -583,10 +592,15 @@ async function main(): Promise<number> {
       const rec: Record<string, unknown> = { seller: `seed ${seller.seedNo} acct ${seller.accountIndex} ${short(seller.address)}`, venue: venue.protocol, nightIn: Number(plan.nightIn) / 1e6, status: "failed", timestamp: new Date().toISOString() };
       swaps.push(rec);
       try {
-        const q = await quoteSwap(plan.nightIn, rules.maxSlippagePct, venue.protocol);
-        const bad = q ? validateQuote(q, rules) : "no quote";
-        if (bad || !q) throw new Error(`quote rejected: ${bad}`);
-        rec.adaOut = Number(q.adaOut) / 1e6; rec.minAdaOut = Number(q.minAdaOut) / 1e6; rec.priceImpactPct = q.priceImpactPct; rec.route = q.route;
+        // Most ADA net of fees wins: aggregator best route vs the deepest single pool.
+        const { best: q, considered } = await pickBestQuote(
+          [await quoteSwap(plan.nightIn, rules.maxSlippagePct), await quoteSwap(plan.nightIn, rules.maxSlippagePct, venue.protocol)],
+          blockfrostReserveLookup(blockfrostKey), rules
+        );
+        for (const c of considered) console.log(`  route ${c.label}: net ${c.net === null ? "-" : ada(c.net)}${c.rejected ? ` · rejected (${c.rejected})` : ""}`);
+        if (!q) throw new Error("no route passed the slippage, impact, freshness and depth checks");
+        rec.route = q.label;
+        rec.adaOut = Number(q.adaOut) / 1e6; rec.minAdaOut = Number(q.minAdaOut) / 1e6; rec.priceImpactPct = q.priceImpactPct; rec.routeDetail = q.route; rec.netAda = Number(q.netLovelace) / 1e6;
         const unsigned = await buildSwapTx(seller.address, q);
         rec.networkFeeAda = Number(await txFeeOf(unsigned)) / 1e6;
         console.log(`  swap ${nightN(plan.nightIn)} NIGHT from ${rec.seller} → ≈${adaN(q.adaOut)} ADA (min ${adaN(q.minAdaOut)}), impact ${q.priceImpactPct.toFixed(2)}%, DEX fee ${adaN(q.dexFee)}, network fee ${rec.networkFeeAda} ADA`);
@@ -633,7 +647,8 @@ async function main(): Promise<number> {
   const claimedOrBuilt = done.filter((r) => ["dry-run", "confirmed", "unconfirmed"].includes(r.status));
   const fees = claimedOrBuilt.reduce((a, r) => a + (r.feeAda ?? 0), 0);
   console.log(`\nClaims: ${claimedOrBuilt.length} ${live ? "submitted" : "built"} · ${claimedOrBuilt.reduce((a, r) => a + r.night, 0).toFixed(6)} NIGHT · fees ${fees.toFixed(6)} ADA · ${done.filter((r) => r.status === "failed").length} failed`);
-  console.log(`Skipped (≤ ${minClaimNight} NIGHT): ${skipped.length} tranche(s), ${skipped.reduce((a, r) => a + r.night, 0).toFixed(6)} NIGHT: ${skipped.map((r) => `seed ${r.seed} acct ${r.account} ${r.night.toFixed(3)}`).join(", ") || "none"}`);
+  console.log(`Final sweep claims: ${sweeps.length} (${sweeps.reduce((a, j) => a + Number(j.target.redeemable) / 1e6, 0).toFixed(6)} NIGHT)`);
+  console.log(`Skipped (≤ ${minClaimNight} NIGHT, will roll into the next thaw): ${skipped.length} tranche(s), ${skipped.reduce((a, r) => a + r.night, 0).toFixed(6)} NIGHT: ${skipped.map((r) => `seed ${r.seed} acct ${r.account} ${r.night.toFixed(3)}`).join(", ") || "none"}`);
   console.log(`Top-ups: ${topups.length ? topups.map((t) => `${t.ada} ADA ${t.from} (${t.status})`).join(", ") : "none needed"}`);
 
   if (testOne && live) {
@@ -690,14 +705,18 @@ async function main(): Promise<number> {
     try {
       const cfgPath = `${OUT_DIR}/config.json`;
       const cfg = existsSync(cfgPath) ? JSON.parse(readFileSync(cfgPath, "utf8")) : {};
-      const result = await buildTracker({ outDir: OUT_DIR, blockfrostKey, minClaimNight, lastRun: new Date().toISOString() });
+      const day = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Argentina/Buenos_Aires" }).format(new Date()).replace(/-/g, ".");
+      const datedTitle = `${day} NIGHT Claims Tracker`;
+      const datedPath = `${OUT_DIR}/${datedTitle}.xlsx`;
+      const result = await buildTracker({ outDir: OUT_DIR, blockfrostKey, minClaimNight, lastRun: new Date().toISOString(), extraXlsxPath: datedPath });
+      cfg.pendingUpload = { title: datedTitle, path: datedPath, previousSheetFileId: cfg.sheetFileId ?? null };
       cfg.lastRun = new Date().toISOString();
       cfg.lastRunMode = live ? "live" : "dry-run";
       cfg.latestXlsx = result.xlsxPath;
       writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
       console.log(`\n## Tracker`);
       for (const [k, v] of Object.entries(result.summary)) if (!k.startsWith("Note")) console.log(`${k}: ${v}`);
-      console.log(`Workbook: ${result.xlsxPath}${cfg.sheetFileId ? ` · Sheet to refresh: ${cfg.sheetFileId}` : " · no sheetFileId in config.json yet"}`);
+      console.log(`Workbook: ${datedPath} → agent: upload as "${datedTitle}", then move ${cfg.sheetFileId ?? "(none)"} into "NIGHT Claims Archive" (see README / npm run tracker:plan)`);
     } catch (err) {
       problems++;
       console.log(`Tracker build failed: ${scrub(err)}`);

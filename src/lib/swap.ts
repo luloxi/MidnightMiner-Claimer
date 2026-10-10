@@ -41,6 +41,11 @@ export interface SwapQuote {
   priceImpactPct: number;
   slippagePct: number;
   route: string;
+  hops: { protocol: string; poolOutRef: string; amountIn: bigint }[];
+  /** ADA actually received: amount out minus DEX/batcher and aggregator fees (deposits come back). */
+  netLovelace: bigint;
+  /** Which route request produced it: "best-route" or a single protocol. */
+  label: string;
   fetchedAt: number;
   /** Request body that produced this quote, reused verbatim by /build-tx. */
   request: Record<string, unknown>;
@@ -90,6 +95,10 @@ export function validateQuote(q: SwapQuote, rules: SwapRules = DEFAULT_SWAP_RULE
   return null;
 }
 
+/**
+ * Quote NIGHT → ADA. With `protocol` the route is pinned to that single DEX (direct pools only);
+ * without it the aggregator picks its best route across DEXes, multi-hop allowed.
+ */
 export async function quoteNightToAda(
   nightRaw: bigint,
   slippagePct = 1,
@@ -100,7 +109,7 @@ export async function quoteNightToAda(
     token_in: NIGHT_UNIT,
     token_out: "lovelace",
     slippage: slippagePct,
-    allow_multi_hops: false,
+    allow_multi_hops: !protocol,
     ...(protocol ? { include_protocols: [protocol] } : {}),
   };
   try {
@@ -114,14 +123,20 @@ export async function quoteNightToAda(
     const d = await res.json() as {
       amount_out: string; min_amount_out: string; total_lp_fee: string; total_dex_fee: string;
       aggregator_fee?: string; deposits?: string; avg_price_impact: number;
-      paths: { protocol: string; amount_in: string }[][];
+      paths: { protocol: string; amount_in: string; pool_out_ref: string }[][];
     };
     const route = d.paths.flat()
       .map((p) => `${p.protocol} ${((Number(p.amount_in) / Number(nightRaw)) * 100).toFixed(0)}%`)
       .join(" + ");
+    const adaOut = BigInt(d.amount_out);
+    const dexFee = BigInt(d.total_dex_fee);
+    const aggregatorFee = BigInt(d.aggregator_fee ?? "0");
     return {
+      hops: d.paths.flat().map((h) => ({ protocol: h.protocol, poolOutRef: h.pool_out_ref, amountIn: BigInt(h.amount_in) })),
+      netLovelace: adaOut - dexFee - aggregatorFee,
+      label: protocol ?? "best-route",
       nightIn: nightRaw,
-      adaOut: BigInt(d.amount_out),
+      adaOut,
       minAdaOut: BigInt(d.min_amount_out),
       lpFee: BigInt(d.total_lp_fee),
       dexFee: BigInt(d.total_dex_fee),
@@ -215,4 +230,62 @@ export async function deepestNightAdaProtocol(): Promise<{ protocol: string; res
   } catch {
     return { protocol: "MinswapV2", reserveUsd: null };
   }
+}
+
+export type PoolReserves = { lovelace: bigint; night: bigint };
+export type ReserveLookup = (poolOutRef: string) => Promise<PoolReserves | null>;
+
+/** Depth floor: every pool on the route must hold real liquidity relative to the trade. */
+export const DEPTH_RULES = { minPoolLovelace: BigInt(1_000_000_000), maxShareOfPoolNight: 0.05 };
+
+export async function checkRouteDepth(q: SwapQuote, lookup: ReserveLookup, rules = DEPTH_RULES): Promise<string | null> {
+  for (const hop of q.hops) {
+    const r = await lookup(hop.poolOutRef);
+    if (!r) return `${hop.protocol}: pool reserves unknown`;
+    if (r.lovelace < rules.minPoolLovelace) return `${hop.protocol}: pool holds only ${Number(r.lovelace) / 1e6} ADA`;
+    if (r.night > BigInt(0) && Number(hop.amountIn) > Number(r.night) * rules.maxShareOfPoolNight) {
+      return `${hop.protocol}: trade is over ${rules.maxShareOfPoolNight * 100}% of the pool's NIGHT`;
+    }
+  }
+  return null;
+}
+
+/** Pick the valid, deep-enough quote that leaves the most ADA after fees. */
+export async function pickBestQuote(
+  quotes: (SwapQuote | null)[],
+  lookup: ReserveLookup,
+  rules: SwapRules = DEFAULT_SWAP_RULES,
+  now = Date.now()
+): Promise<{ best: SwapQuote | null; considered: { label: string; net: bigint | null; rejected: string | null }[] }> {
+  const considered: { label: string; net: bigint | null; rejected: string | null }[] = [];
+  let best: SwapQuote | null = null;
+  for (const q of quotes) {
+    if (!q) { considered.push({ label: "?", net: null, rejected: "no quote" }); continue; }
+    const rejected = validateQuote(q, rules, now) ?? (await checkRouteDepth(q, lookup));
+    considered.push({ label: q.label, net: q.netLovelace, rejected });
+    if (!rejected && (!best || q.netLovelace > best.netLovelace)) best = q;
+  }
+  return { best, considered };
+}
+
+/** Reserves of a pool from its current UTxO, read on Blockfrost. */
+export function blockfrostReserveLookup(blockfrostKey: string): ReserveLookup {
+  return async (ref) => {
+    const [hash, idx] = ref.split("#");
+    try {
+      const res = await fetch(`https://cardano-mainnet.blockfrost.io/api/v0/txs/${hash}/utxos`, {
+        headers: { project_id: blockfrostKey }, signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) return null;
+      const d = await res.json() as { outputs: { output_index: number; amount: { unit: string; quantity: string }[] }[] };
+      const out = d.outputs.find((o) => o.output_index === Number(idx));
+      if (!out) return null;
+      return {
+        lovelace: BigInt(out.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0"),
+        night: BigInt(out.amount.find((a) => a.unit === NIGHT_UNIT)?.quantity ?? "0"),
+      };
+    } catch {
+      return null;
+    }
+  };
 }

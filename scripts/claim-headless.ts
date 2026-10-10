@@ -14,7 +14,7 @@
  *
  * Exit codes: 0 = finished cleanly (including "nothing to claim"), 1 = something failed, 2 = bad usage.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { validateMnemonic } from "bip39";
 import {
   addressVariants,
@@ -29,6 +29,11 @@ import {
 } from "../src/lib/cardano";
 import { BF, bf, MAX_FUNDING_UTXOS, MIN_FUNDING_LOVELACE, runClaim, sleep, txFeeLovelace } from "../src/lib/claim";
 import { fetchWalletThaws, MidnightThaw } from "../src/lib/thaws";
+import {
+  buildSwapTx, deepestNightAdaProtocol, DEFAULT_SWAP_RULES, planSwap, quoteNightToAda as quoteSwap,
+  submitSwap, txFeeOf, validateQuote, witnessSetFor,
+} from "../src/lib/swap";
+import { buildTracker } from "./tracker";
 
 const SEED_VARS = ["MIDNIGHT_SEED_1", "MIDNIGHT_SEED_2"] as const;
 const NIGHT_UNIT = `${NIGHT_POLICY}${NIGHT_NAME}`;
@@ -80,6 +85,10 @@ function usage(code = 2): never {
   --accounts N         accounts scanned per seed (env CLAIM_ACCOUNTS, default 30)
   --min-claim X        only claim tranches above X NIGHT (env CLAIM_MIN_NIGHT, default 5); smaller ones
                        are reported as skipped and roll into the next thaw
+  --weekly             weekly protocol: claims, top-ups and (if triggered) a swap, then rebuild the
+                       tracker workbook at /workspace/midnight/latest-tracker.xlsx
+  --allow-swap         with --live, allow the NIGHT→ADA swap fallback to be submitted
+  --swap-cap N         most NIGHT one run may sell (env SWAP_CAP_NIGHT, default 300)
   --test-one           exactly one claim: the smallest tranche above the minimum, paid by the
                        richest address of the OTHER seed
   --addresses N        address indexes per account (env CLAIM_ADDRESSES_PER_ACCOUNT, default 1)
@@ -104,6 +113,9 @@ let live = false;
 let accounts = parseIntArg(process.env.CLAIM_ACCOUNTS ?? "30", "CLAIM_ACCOUNTS", 200);
 let addressesPerAccount = parseIntArg(process.env.CLAIM_ADDRESSES_PER_ACCOUNT ?? "1", "CLAIM_ADDRESSES_PER_ACCOUNT", 50);
 let testOne = false;
+let weekly = false;
+let allowSwap = false;
+let swapCapNight = Number(process.env.SWAP_CAP_NIGHT ?? "300");
 let minClaimNight = Number(process.env.CLAIM_MIN_NIGHT ?? "5");
 let forcedPaymaster: { seed: number; account: number } | null = null;
 for (let i = 0; i < argv.length; i++) {
@@ -112,6 +124,12 @@ for (let i = 0; i < argv.length; i++) {
   if (arg === "--live") live = true;
   else if (arg === "--report" || arg === "--dry-run") { /* default mode */ }
   else if (arg === "--test-one") testOne = true;
+  else if (arg === "--weekly") weekly = true;
+  else if (arg === "--allow-swap") allowSwap = true;
+  else if (arg === "--swap-cap") {
+    swapCapNight = Number(next());
+    if (!Number.isFinite(swapCapNight) || swapCapNight < 0) { console.error("--swap-cap must be a number ≥ 0"); process.exit(2); }
+  }
   else if (arg === "--min-claim") {
     minClaimNight = Number(next());
     if (!Number.isFinite(minClaimNight) || minClaimNight < 0) { console.error("--min-claim must be a number ≥ 0"); process.exit(2); }
@@ -235,6 +253,7 @@ interface WalletRow {
   nextThawAt: string | null;
   lookupFailed: boolean;
   targets: { chain: AddressChain; kind: AddressKind; address: string; redeemable: string }[];
+  variantAddresses: string[];
   thaws: { address: string; kind: AddressKind; chain: AddressChain; amount: number; status: string; date: string | null; txId: string | null }[];
 }
 
@@ -338,6 +357,7 @@ async function main(): Promise<number> {
         claimable: thaws?.claimable ?? BigInt(0), nextThawAt: thaws?.nextThawAt ?? null,
         lookupFailed: !thaws || thaws.lookupFailed, targets: thaws?.targets ?? [],
         thaws: thawList,
+        variantAddresses: addressVariants(wallet).map((v) => v.address),
       };
       if (row.lookupFailed) problems++;
 
@@ -400,6 +420,7 @@ async function main(): Promise<number> {
   const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
   const records: ClaimRecord[] = [];
   const topups: TopupRecord[] = [];
+  const swaps: Record<string, unknown>[] = [];
   const minRaw = BigInt(Math.round(minClaimNight * 1_000_000));
 
   type Job = { row: WalletRow; target: WalletRow["targets"][number] };
@@ -544,6 +565,53 @@ async function main(): Promise<number> {
     return rec;
   }
 
+  // Swap fallback: only when the paymaster can't cover the pending claims and top-ups can't either.
+  if (!testOne && jobs.length) {
+    const pending = BigInt(jobs.length) * WORST_CLAIM_OUTFLOW;
+    const capacity = sum(ranked.filter((a) => a.address !== pm.address && a.lovelace > BigInt(5_000_000)).map((a) => a.lovelace - BigInt(2_500_000)));
+    const seller = [...addrs].sort((a, b) => (a.night > b.night ? -1 : 1))[0];
+    const venue = await deepestNightAdaProtocol();
+    const probe = await quoteSwap(BigInt(100_000_000), 1, venue.protocol);
+    const rules = { ...DEFAULT_SWAP_RULES, capNightRaw: BigInt(Math.round(swapCapNight * 1e6)) };
+    const plan = planSwap({
+      paymasterTop3: pmTop3, pendingClaimCost: pending, topupCapacity: capacity,
+      sellerNightRaw: seller?.night ?? BigInt(0),
+      lovelacePerNightRaw: probe ? Number(probe.adaOut) / Number(probe.nightIn) : 0, rules,
+    });
+    console.log(`\n## Swap check · venue ${venue.protocol}${venue.reserveUsd ? ` ($${Math.round(venue.reserveUsd).toLocaleString()} NIGHT/ADA liquidity)` : ""} · pending claims need ≈${ada(pending + MIN_FUNDING_LOVELACE)}, paymaster has ${ada(pmTop3)}, top-up capacity ${ada(capacity)} → ${plan.trigger ? "SWAP TRIGGERED" : `no swap (${plan.reason})`}`);
+    if (plan.trigger && seller) {
+      const rec: Record<string, unknown> = { seller: `seed ${seller.seedNo} acct ${seller.accountIndex} ${short(seller.address)}`, venue: venue.protocol, nightIn: Number(plan.nightIn) / 1e6, status: "failed", timestamp: new Date().toISOString() };
+      swaps.push(rec);
+      try {
+        const q = await quoteSwap(plan.nightIn, rules.maxSlippagePct, venue.protocol);
+        const bad = q ? validateQuote(q, rules) : "no quote";
+        if (bad || !q) throw new Error(`quote rejected: ${bad}`);
+        rec.adaOut = Number(q.adaOut) / 1e6; rec.minAdaOut = Number(q.minAdaOut) / 1e6; rec.priceImpactPct = q.priceImpactPct; rec.route = q.route;
+        const unsigned = await buildSwapTx(seller.address, q);
+        rec.networkFeeAda = Number(await txFeeOf(unsigned)) / 1e6;
+        console.log(`  swap ${nightN(plan.nightIn)} NIGHT from ${rec.seller} → ≈${adaN(q.adaOut)} ADA (min ${adaN(q.minAdaOut)}), impact ${q.priceImpactPct.toFixed(2)}%, DEX fee ${adaN(q.dexFee)}, network fee ${rec.networkFeeAda} ADA`);
+        if (!live || !allowSwap) {
+          rec.status = live ? "blocked (no --allow-swap)" : "dry-run";
+          console.log(`  ${live ? "NOT submitted: --allow-swap not set" : "dry-run: built, not submitted"}`);
+        } else {
+          if (validateQuote(q, rules)) throw new Error("quote went stale before submit");
+          const { signingKeyHex } = await deriveSigningKey(seller.mnemonic, seller.accountIndex, seller.index, seller.chain, seller.kind);
+          const txId = await submitSwap(unsigned, await witnessSetFor(unsigned, signingKeyHex));
+          rec.txHash = txId;
+          rec.status = (await waitForConfirmation(txId)) ? "order confirmed" : "order unconfirmed";
+          console.log(`  SWAP order ${rec.status} · https://cardanoscan.io/transaction/${txId}`);
+          await sleep(60_000); // let the batcher fill the order before re-reading balances
+          seller.utxos = await utxosOf(seller.address);
+          seller.lovelace = sum(seller.utxos.map(lovelaceOf));
+          if (seller.address === pm.address) await refreshPaymaster();
+        }
+      } catch (err) {
+        rec.error = scrub(err);
+        console.log(`  swap aborted: ${rec.error}`);
+      }
+    }
+  }
+
   console.log(`\n## 2. Claims (${live ? "SUBMITTING" : "built in memory, not submitted"}) · min claim > ${minClaimNight} NIGHT · paymaster seed ${pm.seedNo} acct ${pm.accountIndex} ${short(pm.address)}`);
   const done: ClaimRecord[] = [];
   for (const job of jobs) done.push(await doClaim(job, 1));
@@ -576,13 +644,13 @@ async function main(): Promise<number> {
   // Records (no secrets: addresses, amounts, hashes only)
   mkdirSync(OUT_DIR, { recursive: true });
   const base = `${OUT_DIR}/claims-${live ? "live" : "dryrun"}${testOne ? "-test-one" : ""}-${runStamp}`;
-  writeFileSync(`${base}.json`, JSON.stringify({ live, testOne, minClaimNight, paymaster: { seed: pm.seedNo, account: pm.accountIndex, address: pm.address }, claims: records, topups }, null, 2));
+  writeFileSync(`${base}.json`, JSON.stringify({ live, testOne, minClaimNight, paymaster: { seed: pm.seedNo, account: pm.accountIndex, address: pm.address }, claims: records, topups, swaps }, null, 2));
   const cols = ["seed", "account", "index", "kind", "chain", "shortAddress", "address", "night", "status", "txHash", "cardanoscan", "feeAda", "paymasterNetAda", "timestamp", "attempt", "error"] as const;
   writeFileSync(`${base}.csv`, [cols.join(","), ...records.map((r) => cols.map((c) => JSON.stringify(r[c] ?? "")).join(","))].join("\n") + "\n");
   writeFileSync(`${OUT_DIR}/snapshot-${runStamp}.json`, JSON.stringify(rows.map((r) => ({
     seed: r.seedNo, account: r.accountIndex, index: r.index, address: r.baseAddress,
     ada: Number(r.lovelace) / 1e6, nightHeld: Number(r.night) / 1e6, claimable: Number(r.claimable) / 1e6,
-    nextThawAt: r.nextThawAt, thaws: r.thaws,
+    nextThawAt: r.nextThawAt, variantAddresses: r.variantAddresses, thaws: r.thaws,
   })), null, 2));
   console.log(`Records: ${base}.json / .csv · snapshot ${OUT_DIR}/snapshot-${runStamp}.json`);
 
@@ -617,6 +685,24 @@ async function main(): Promise<number> {
   printCalendar(calendar);
 
   console.log(`\nSummary: ${rows.length} wallet(s) · claimable ${nightN(totalClaimable)} NIGHT · ${claimedOrBuilt.length} claim(s) ${live ? "submitted" : "built, 0 submitted (dry-run)"} · ${skipped.length} skipped below min · ${problems} problem(s)`);
+
+  if (weekly) {
+    try {
+      const cfgPath = `${OUT_DIR}/config.json`;
+      const cfg = existsSync(cfgPath) ? JSON.parse(readFileSync(cfgPath, "utf8")) : {};
+      const result = await buildTracker({ outDir: OUT_DIR, blockfrostKey, minClaimNight, lastRun: new Date().toISOString() });
+      cfg.lastRun = new Date().toISOString();
+      cfg.lastRunMode = live ? "live" : "dry-run";
+      cfg.latestXlsx = result.xlsxPath;
+      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+      console.log(`\n## Tracker`);
+      for (const [k, v] of Object.entries(result.summary)) if (!k.startsWith("Note")) console.log(`${k}: ${v}`);
+      console.log(`Workbook: ${result.xlsxPath}${cfg.sheetFileId ? ` · Sheet to refresh: ${cfg.sheetFileId}` : " · no sheetFileId in config.json yet"}`);
+    } catch (err) {
+      problems++;
+      console.log(`Tracker build failed: ${scrub(err)}`);
+    }
+  }
   return problems > 0 ? 1 : 0;
 }
 

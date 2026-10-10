@@ -104,3 +104,37 @@ Exit code 0 means it finished cleanly (also when nothing was claimable), 1 means
 2 means bad usage.
 
 `npm test` runs an offline test that proves a dry-run never reaches `/tx/submit`.
+
+## Weekly protocol
+
+```bash
+npm run weekly        # dry-run under the submit guard: scan, top-up/swap check, claims > 5 NIGHT built, tracker rebuilt
+npm run weekly:live   # same, but submits claims and any needed ADA top-ups between own addresses
+npm run weekly:live -- --allow-swap   # additionally lets the NIGHT→ADA swap fallback be submitted
+```
+
+One run does, in order:
+
+1. Scans 30 accounts per seed (thaw schedules, UTxOs) and picks the paymaster (most ADA).
+2. Swap check: only if the paymaster's 3 largest UTxOs are below the pending claim cost + 3 ADA and
+   no own address can top it up. It then sells just enough NIGHT for the shortfall + 5 ADA (min 100,
+   max `--swap-cap`, default 300 NIGHT) on the DEX with the deepest NIGHT/ADA pool (checked at run
+   time, Minswap V2 today) via the Minswap aggregator, with 1% max slippage, and aborts if price
+   impact is over 2% or the quote is older than 60 s. Submitting needs `--live --allow-swap`.
+3. Claims every tranche above 5 NIGHT, one at a time, topping the paymaster up from another own
+   address when it would drop below the funding floor. Smaller tranches wait; the thaw API adds a
+   skipped tranche to the address's next one. Claim everything before about 2027-03-04.
+4. Writes per-claim records and a snapshot to `/workspace/midnight/`, then rebuilds the tracker
+   workbook `/workspace/midnight/latest-tracker.xlsx` (tabs Summary, Wallets, Thaws, Claims log) and
+   CSVs under `/workspace/midnight/latest/`. `npm run tracker` rebuilds it on its own.
+
+A run with nothing to do spends nothing and exits 0.
+
+### Google Sheet
+
+The Sheet lives in Luciano's personal Drive; its file id is in `/workspace/midnight/config.json`
+(`sheetFileId`, no secrets in that file). Node can't reach the Drive connector, so the agent running
+the routine uploads `latest-tracker.xlsx` after the script, converting it to a Google Sheet. The
+connector can't overwrite a Sheet's content in place, so each upload is a new Sheet: the agent
+records the new id in `config.json` and leaves the older one alone (never shared, never deleted
+without asking).
